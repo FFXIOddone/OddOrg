@@ -1,6 +1,4 @@
-# FFXIOddone
-
-Ashita addon collection for FFXI automation experiments. Currently includes `oddorg`, a guarded storage organizer that previews and executes item moves through the normal Inventory flow.
+# OddOrg
 
 ## Use
 
