@@ -1,0 +1,30 @@
+# FFXIOddone
+
+Ashita addon collection for FFXI automation experiments. Currently includes `oddorg`, a guarded storage organizer that previews and executes item moves through the normal Inventory flow.
+
+## Use
+
+Use `oddorg` in a Mog House while naked. Remove equipped gear first so equipment can be organized, and make sure the storage tabs you want to use are accessible.
+
+Copy `addons/oddorg` into your Ashita `addons` folder, then load it in game:
+
+```txt
+/addon load oddorg
+```
+
+## Commands
+
+```txt
+/oddorg organize preview all
+/oddorg organize run all
+/oddorg organize stop
+/oddorg organize status
+/oddorg probes on
+/oddorg probes off
+/oddorg probes clear
+/oddorg probes status
+```
+
+Scopes: `all`, `wardrobes`, or `storage`.
+
+Options: `equipped`, `social`, `delay=0.8`, `probes`, `noprobes`.
