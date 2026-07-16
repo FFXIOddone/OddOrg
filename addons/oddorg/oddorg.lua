@@ -1,13 +1,21 @@
 addon.name = "oddorg"
 addon.author = "Odd"
-addon.version = "0.2.0"
+addon.version = "1.0.0"
 addon.desc = "Guarded in-addon storage organization mover."
 
 require("common")
 local bit = require("bit")
 local chat = require("chat")
+local imgui_ok, imgui = pcall(require, "imgui")
+if not imgui_ok then
+    imgui = nil
+end
 
 local MOVE_PACKET_ID = 0x029
+local EPHEMERAL_TRADE_PACKET_ID = 0x036
+local EPHEMERAL_TRADE_BATCH_SIZE = 8
+local EPHEMERAL_TRADE_ANIMATION_DELAY = 10
+local EPHEMERAL_UNIT_CAP = 5000
 local DESTINATION_AUTO_INDEX = 0x52
 local INVENTORY_CONTAINER_ID = 0
 local PROBES_ENABLED = true
@@ -105,6 +113,25 @@ local STORAGE_BUCKETS = {
     { container_id = 1, label = "Safe", description = "rare/ex, furnishings, oddities, and long-term overflow", categories = { "rare_misc", "furnishing", "other" } },
 }
 
+local EPHEMERAL_ITEMS = {
+    [4096] = { element = "fire", kind = "crystal", unit_value = 1, name = "Fire Crystal" },
+    [4097] = { element = "ice", kind = "crystal", unit_value = 1, name = "Ice Crystal" },
+    [4098] = { element = "wind", kind = "crystal", unit_value = 1, name = "Wind Crystal" },
+    [4099] = { element = "earth", kind = "crystal", unit_value = 1, name = "Earth Crystal" },
+    [4100] = { element = "lightning", kind = "crystal", unit_value = 1, name = "Lightning Crystal" },
+    [4101] = { element = "water", kind = "crystal", unit_value = 1, name = "Water Crystal" },
+    [4102] = { element = "light", kind = "crystal", unit_value = 1, name = "Light Crystal" },
+    [4103] = { element = "dark", kind = "crystal", unit_value = 1, name = "Dark Crystal" },
+    [4104] = { element = "fire", kind = "cluster", unit_value = 12, name = "Fire Cluster" },
+    [4105] = { element = "ice", kind = "cluster", unit_value = 12, name = "Ice Cluster" },
+    [4106] = { element = "wind", kind = "cluster", unit_value = 12, name = "Wind Cluster" },
+    [4107] = { element = "earth", kind = "cluster", unit_value = 12, name = "Earth Cluster" },
+    [4108] = { element = "lightning", kind = "cluster", unit_value = 12, name = "Lightning Cluster" },
+    [4109] = { element = "water", kind = "cluster", unit_value = 12, name = "Water Cluster" },
+    [4110] = { element = "light", kind = "cluster", unit_value = 12, name = "Light Cluster" },
+    [4111] = { element = "dark", kind = "cluster", unit_value = 12, name = "Dark Cluster" },
+}
+
 local organizer = {
     running = false,
     queue = {},
@@ -117,6 +144,28 @@ local organizer = {
     error = nil,
     summary = nil,
     awaiting_inventory = nil,
+}
+
+local ephemeral = {
+    running = false,
+    queue = {},
+    cursor = 1,
+    last_send = 0,
+    delay = 0.8,
+    inventory_wait_timeout = 5.0,
+    scope = "all",
+    started_at = 0,
+    error = nil,
+    target = nil,
+    summary = nil,
+    awaiting_inventory = nil,
+    animation_wait_until = nil,
+    animation_wait_last_probe = 0,
+}
+
+local ui = {
+    visible = false,
+    scope = "all",
 }
 
 local bag_access_pointer = nil
@@ -1541,7 +1590,7 @@ end
 
 local function parse_organize_options(args)
     local options = {
-        action = args[3] or "status",
+        action = string.lower(args[3] or "status"),
         scope = "all",
         allow_equipped = false,
         include_social = false,
@@ -1746,6 +1795,11 @@ local function handle_organize(args)
         return
     end
 
+    if ephemeral.running then
+        say("ephemeral dump is running; stop it before organizing storage.")
+        return
+    end
+
     local plan, queue, err = build_preview_or_queue(options)
     if plan == nil then
         write_probe("plan_done", "REJECT", err, options.scope)
@@ -1770,6 +1824,7 @@ local function handle_organize(args)
         logical = #plan.logical_moves,
         physical = #queue,
     }
+    ui.visible = true
     write_probe("queue_start", "OK", "organization queue started", ("scope=%s physical=%u"):format(options.scope, #queue))
     say(("organizer started: logical=%u physical=%u delay=%.2fs"):format(#plan.logical_moves, #queue, organizer.delay))
 end
@@ -1798,6 +1853,745 @@ local function handle_probes(args)
         return
     end
     say("usage: /oddorg probes on|off|clear|status")
+end
+
+local function ephemeral_units_for_item(item_id, quantity)
+    local info = EPHEMERAL_ITEMS[tonumber(item_id) or 0]
+    if info == nil then
+        return 0
+    end
+    return (tonumber(quantity) or 0) * info.unit_value
+end
+
+local function get_current_target()
+    local target_manager = AshitaCore:GetMemoryManager():GetTarget()
+    local entity_manager = AshitaCore:GetMemoryManager():GetEntity()
+    if target_manager == nil or entity_manager == nil then
+        return nil, "target resources unavailable"
+    end
+
+    local index = safe_call(0, function()
+        if target_manager:GetIsSubTargetActive() > 0 then
+            return target_manager:GetTargetIndex(1)
+        end
+        return target_manager:GetTargetIndex(0)
+    end) or 0
+
+    if index <= 0 then
+        return nil, "target an Ephemeral Moogle first"
+    end
+
+    local name = safe_call("", function() return entity_manager:GetName(index) end) or ""
+    local server_id = tonumber(safe_call(0, function() return entity_manager:GetServerId(index) end)) or 0
+    local raw_distance = safe_call(nil, function() return entity_manager:GetDistance(index) end)
+    local distance = nil
+    if tonumber(raw_distance) ~= nil then
+        distance = math.sqrt(tonumber(raw_distance))
+    end
+
+    return {
+        index = index,
+        name = name,
+        server_id = server_id,
+        distance = distance,
+    }, nil
+end
+
+local function validate_ephemeral_target()
+    local target, err = get_current_target()
+    if target == nil then
+        return nil, err
+    end
+
+    local target_name = string.lower(tostring(target.name or ""))
+    if not target_name:find("ephemeral moogle", 1, true) then
+        return nil, "target is not an Ephemeral Moogle"
+    end
+
+    if target.distance ~= nil and target.distance > 6.0 then
+        return nil, ("Ephemeral Moogle is too far away %.2f/6.00"):format(target.distance)
+    end
+
+    return target, nil
+end
+
+local function ephemeral_scope_allows(scope, container_id)
+    if scope == "all" then
+        return true
+    end
+    if scope == "inventory" then
+        return container_id == INVENTORY_CONTAINER_ID
+    end
+    return container_id ~= INVENTORY_CONTAINER_ID
+end
+
+local function ephemeral_sort_candidates(candidates)
+    table.sort(candidates, function(left, right)
+        local left_info = EPHEMERAL_ITEMS[left.item_id]
+        local right_info = EPHEMERAL_ITEMS[right.item_id]
+        local left_unit = tonumber(left_info and left_info.unit_value) or 0
+        local right_unit = tonumber(right_info and right_info.unit_value) or 0
+        if left_unit ~= right_unit then
+            return left_unit > right_unit
+        end
+        local left_name = string.lower(left.item_name or "")
+        local right_name = string.lower(right.item_name or "")
+        if left_name ~= right_name then
+            return left_name < right_name
+        end
+        if left.container_id ~= right.container_id then
+            if left.container_id == INVENTORY_CONTAINER_ID then
+                return true
+            end
+            if right.container_id == INVENTORY_CONTAINER_ID then
+                return false
+            end
+            return left.container_id < right.container_id
+        end
+        return left.index < right.index
+    end)
+end
+
+local function ephemeral_action_id(prefix, item, suffix)
+    return ("%s-%s-%02u-%03u-%s"):format(prefix, item.item_id, item.container_id, item.index, suffix)
+end
+
+local function build_ephemeral_dump_queue(options)
+    local snapshot, _, err = collect_live_items()
+    if snapshot == nil then
+        return nil, nil, err
+    end
+
+    local candidates = {}
+    local summary = {
+        items = 0,
+        stage_moves = 0,
+        trades = 0,
+        units = 0,
+        skipped_locked = 0,
+        by_element = {},
+    }
+
+    for _, item in ipairs(snapshot.items) do
+        local info = EPHEMERAL_ITEMS[item.item_id]
+        if info ~= nil and item.quantity > 0 and ephemeral_scope_allows(options.scope, item.container_id) then
+            if item.container_id == INVENTORY_CONTAINER_ID and bit.band(tonumber(item.flags) or 0, 1) ~= 0 then
+                summary.skipped_locked = summary.skipped_locked + 1
+                write_probe("ephemeral_skip_locked", "REJECT", item.item_name, ("Inventory[%u]"):format(item.index))
+            else
+                table.insert(candidates, item)
+            end
+        end
+    end
+
+    ephemeral_sort_candidates(candidates)
+
+    local queue = {}
+    local character_slug = options.character_slug
+
+    local function make_trade_action(item)
+        local info = EPHEMERAL_ITEMS[item.item_id]
+        local units = ephemeral_units_for_item(item.item_id, item.quantity)
+        local base_id = ephemeral_action_id("ephemeral", item, info.kind)
+        return {
+            kind = "trade",
+            move_id = base_id .. "-trade",
+            character_slug = character_slug,
+            item_id = item.item_id,
+            quantity = item.quantity,
+            source_container_id = INVENTORY_CONTAINER_ID,
+            source_index = item.container_id == INVENTORY_CONTAINER_ID and item.index or 0,
+            item_name = item.item_name,
+            stack_size = item.stack_size,
+            element = info.element,
+            item_kind = info.kind,
+            units = units,
+        }
+    end
+
+    local function count_item(item)
+        local info = EPHEMERAL_ITEMS[item.item_id]
+        local units = ephemeral_units_for_item(item.item_id, item.quantity)
+        summary.items = summary.items + 1
+        summary.trades = summary.trades + 1
+        summary.units = summary.units + units
+        summary.by_element[info.element] = (summary.by_element[info.element] or 0) + units
+    end
+
+    local inventory_candidates = {}
+    local storage_candidates = {}
+    for _, item in ipairs(candidates) do
+        if item.container_id == INVENTORY_CONTAINER_ID then
+            table.insert(inventory_candidates, item)
+        else
+            table.insert(storage_candidates, item)
+        end
+    end
+
+    for _, item in ipairs(inventory_candidates) do
+        table.insert(queue, make_trade_action(item))
+        count_item(item)
+    end
+
+    local chunk = {}
+    local function flush_storage_chunk()
+        if #chunk == 0 then
+            return
+        end
+
+        local trade_actions = {}
+        for _, item in ipairs(chunk) do
+            local info = EPHEMERAL_ITEMS[item.item_id]
+            local units = ephemeral_units_for_item(item.item_id, item.quantity)
+            local base_id = ephemeral_action_id("ephemeral", item, info.kind)
+            local trade_action = make_trade_action(item)
+            trade_action.source_index = 0
+
+            local stage_move = {
+                move_id = base_id .. "-stage",
+                character_slug = character_slug,
+                item_id = item.item_id,
+                quantity = item.quantity,
+                source_container_id = item.container_id,
+                source_index = item.index,
+                target_container_id = INVENTORY_CONTAINER_ID,
+                item_name = item.item_name,
+                stack_size = item.stack_size,
+            }
+
+            table.insert(queue, {
+                kind = "stage",
+                move_id = stage_move.move_id,
+                stage_move = stage_move,
+                trade_move_id = trade_action.move_id,
+                item_name = item.item_name,
+                quantity = item.quantity,
+                units = units,
+            })
+            table.insert(trade_actions, trade_action)
+            summary.stage_moves = summary.stage_moves + 1
+            count_item(item)
+        end
+
+        for _, trade_action in ipairs(trade_actions) do
+            table.insert(queue, trade_action)
+        end
+
+        chunk = {}
+    end
+
+    for _, item in ipairs(storage_candidates) do
+        table.insert(chunk, item)
+        if #chunk >= EPHEMERAL_TRADE_BATCH_SIZE then
+            flush_storage_chunk()
+        end
+    end
+    flush_storage_chunk()
+
+    write_probe(
+        "ephemeral_plan_done",
+        "OK",
+        "ephemeral dump queue built",
+        ("scope=%s items=%u stage=%u trades=%u units=%u cap_per_element=%u skipped_locked=%u"):format(
+            options.scope,
+            summary.items,
+            summary.stage_moves,
+            summary.trades,
+            summary.units,
+            EPHEMERAL_UNIT_CAP,
+            summary.skipped_locked
+        )
+    )
+
+    return queue, summary, nil
+end
+
+local function find_inventory_item_for_ephemeral(action)
+    local inv = AshitaCore:GetMemoryManager():GetInventory()
+    local resources = AshitaCore:GetResourceManager()
+    if inv == nil or resources == nil then
+        return false, nil
+    end
+
+    local probe_move = {
+        source_container_id = INVENTORY_CONTAINER_ID,
+        source_index = 0,
+        item_id = action.item_id,
+        quantity = action.quantity,
+        item_name = action.item_name,
+        stack_size = action.stack_size,
+    }
+    local resolved = resolve_inventory_source(inv, resources, probe_move)
+    if resolved then
+        return true, probe_move.source_index
+    end
+    return false, nil
+end
+
+local function find_ephemeral_queue_action(move_id)
+    for _, action in ipairs(ephemeral.queue or {}) do
+        if action.move_id == move_id then
+            return action
+        end
+    end
+    return nil
+end
+
+local function wait_for_ephemeral_inventory_stage(now)
+    if ephemeral.awaiting_inventory == nil then
+        return true
+    end
+
+    local waiting = ephemeral.awaiting_inventory
+    local visible, index = find_inventory_item_for_ephemeral(waiting)
+    if visible then
+        local trade_action = find_ephemeral_queue_action(waiting.trade_move_id)
+        if trade_action ~= nil then
+            trade_action.source_index = index
+        end
+        write_probe(
+            "ephemeral_inventory_stage_visible",
+            "OK",
+            "staged item is visible in Inventory",
+            ("%s inventory_index=%u"):format(waiting.trade_move_id, tonumber(index) or 0)
+        )
+        ephemeral.awaiting_inventory = nil
+        return true
+    end
+
+    local elapsed = now - waiting.started_at
+    if elapsed >= ephemeral.inventory_wait_timeout then
+        ephemeral.running = false
+        ephemeral.error = "ephemeral inventory stage timeout"
+        local details = ("%s x%u after %.2fs stage=%s"):format(waiting.item_name, waiting.quantity, elapsed, waiting.stage_move_id)
+        write_audit(waiting.trade_move_id, "REJECT", "ephemeral inventory stage timeout", details)
+        write_probe("ephemeral_inventory_stage_timeout", "REJECT", "staged item did not appear in Inventory", details)
+        say("ephemeral dump stopped waiting for Inventory stage: " .. waiting.item_name)
+        return false
+    end
+
+    if waiting.last_probe == 0 or (now - waiting.last_probe) >= 1.0 then
+        waiting.last_probe = now
+        write_probe(
+            "ephemeral_wait_inventory",
+            "WAIT",
+            "staged item not visible yet",
+            ("%s x%u elapsed=%.2f"):format(waiting.item_name, waiting.quantity, elapsed)
+        )
+    end
+    return false
+end
+
+local function validate_ephemeral_trade_action(action)
+    local inv = AshitaCore:GetMemoryManager():GetInventory()
+    local resources = AshitaCore:GetResourceManager()
+    if inv == nil or resources == nil then
+        return false, "inventory resources unavailable", ""
+    end
+
+    if EPHEMERAL_ITEMS[action.item_id] == nil then
+        return false, "item is not an Ephemeral Moogle crystal or cluster", tostring(action.item_id)
+    end
+
+    if action.quantity <= 0 then
+        return false, "quantity must be positive", tostring(action.quantity)
+    end
+
+    if action.source_index == 0 then
+        local resolved, resolved_index = find_inventory_item_for_ephemeral(action)
+        if not resolved then
+            return false, "inventory source item not found", ("%s x%u"):format(action.item_name, action.quantity)
+        end
+        action.source_index = resolved_index
+    end
+
+    local item = get_container_item(inv, INVENTORY_CONTAINER_ID, action.source_index)
+    if not is_real_item(item) then
+        return false, "source inventory slot is empty", tostring(action.source_index)
+    end
+    if tonumber(item.Id) ~= action.item_id then
+        return false, "source item id mismatch", ("expected=%u actual=%u"):format(action.item_id, tonumber(item.Id) or 0)
+    end
+    if tonumber(item.Count) < action.quantity then
+        return false, "source quantity too small", ("expected=%u actual=%u"):format(action.quantity, tonumber(item.Count) or 0)
+    end
+    if bit.band(tonumber(item.Flags) or 0, 1) ~= 0 then
+        return false, "source inventory item is locked", tostring(action.source_index)
+    end
+
+    local resource = resources:GetItemById(item.Id)
+    if not resource_name_matches(resource, action.item_name) then
+        return false, "source item name mismatch", action.item_name
+    end
+
+    return true, "validated ephemeral trade", ("Inventory[%u] %s x%u units=%u"):format(
+        action.source_index,
+        action.item_name,
+        action.quantity,
+        action.units
+    )
+end
+
+local function send_ephemeral_trade_packet(target, entries)
+    local quantities = {}
+    local indices = {}
+    for index = 1, 10, 1 do
+        quantities[index] = 0
+        indices[index] = 0
+    end
+
+    for index, entry in ipairs(entries) do
+        quantities[index] = entry.quantity
+        indices[index] = entry.source_index
+    end
+
+    local packet = struct.pack('IIIIIIIIIIIIBBBBBBBBBBHBBBB',
+        0,
+        target.server_id,
+        quantities[1],
+        quantities[2],
+        quantities[3],
+        quantities[4],
+        quantities[5],
+        quantities[6],
+        quantities[7],
+        quantities[8],
+        quantities[9],
+        quantities[10],
+        indices[1],
+        indices[2],
+        indices[3],
+        indices[4],
+        indices[5],
+        indices[6],
+        indices[7],
+        indices[8],
+        indices[9],
+        indices[10],
+        target.index,
+        #entries,
+        0,
+        0,
+        0):totable()
+    AshitaCore:GetPacketManager():AddOutgoingPacket(EPHEMERAL_TRADE_PACKET_ID, packet)
+end
+
+local function build_ephemeral_trade_batch(start_cursor)
+    local entries = {}
+    local ids = {}
+    local units = 0
+    local cursor = start_cursor
+
+    while cursor <= #ephemeral.queue and #entries < EPHEMERAL_TRADE_BATCH_SIZE do
+        local action = ephemeral.queue[cursor]
+        if action == nil or action.kind ~= "trade" then
+            break
+        end
+
+        local ok, message, details = validate_ephemeral_trade_action(action)
+        if not ok then
+            return nil, cursor, message, details
+        end
+
+        table.insert(entries, action)
+        table.insert(ids, action.move_id)
+        units = units + (tonumber(action.units) or 0)
+        cursor = cursor + 1
+    end
+
+    if #entries == 0 then
+        return nil, start_cursor, "no trade entries available", tostring(start_cursor)
+    end
+
+    return {
+        entries = entries,
+        move_id = table.concat(ids, ","),
+        next_cursor = cursor,
+        units = units,
+    }, cursor, nil, nil
+end
+
+local function stop_ephemeral(message)
+    ephemeral.running = false
+    ephemeral.error = message
+    ephemeral.awaiting_inventory = nil
+    ephemeral.animation_wait_until = nil
+    ephemeral.animation_wait_last_probe = 0
+end
+
+local function handle_ephemeral(args)
+    if args[3] == "dump" or args[3] == "status" or args[3] == "stop" then
+        -- Explicit verbs remain visible for static safety tests and operator trust.
+    end
+
+    local action = string.lower(args[3] or "status")
+
+    if action == "stop" then
+        stop_ephemeral(nil)
+        write_probe("ephemeral_queue_stop", "OK", "stopped by command", "cursor=" .. tostring(ephemeral.cursor))
+        say("ephemeral dump stopped.")
+        return
+    end
+
+    if action == "status" then
+        local remaining = math.max(0, #ephemeral.queue - ephemeral.cursor + 1)
+        say(("ephemeral running=%s queue=%u cursor=%u remaining=%u target=%s probes=%s"):format(
+            tostring(ephemeral.running),
+            #ephemeral.queue,
+            ephemeral.cursor,
+            remaining,
+            ephemeral.target and tostring(ephemeral.target.server_id) or "none",
+            tostring(PROBES_ENABLED)
+        ))
+        write_probe("ephemeral_queue_status", "OK", "status requested", "remaining=" .. tostring(remaining))
+        return
+    end
+
+    if action ~= "dump" then
+        say("usage: /oddorg ephemeral dump|stop|status [all|inventory|storage] [probes|noprobes] [delay=0.8]")
+        return
+    end
+
+    if organizer.running then
+        local message = "organizer running; stop it before ephemeral dump"
+        write_probe("ephemeral_queue_start", "REJECT", message, "")
+        print(chat.header("OddOrg") .. chat.error(message))
+        return
+    end
+
+    if ephemeral.running then
+        say("ephemeral dump is already running.")
+        return
+    end
+
+    local options = {
+        scope = "all",
+        character_slug = get_player_slug(),
+    }
+
+    for index = 4, #args, 1 do
+        local value = string.lower(args[index] or "")
+        if value == "all" or value == "inventory" then
+            options.scope = value
+        elseif value == "storage" or value == "mog" or value == "bags" then
+            options.scope = "storage"
+        elseif value == "noprobes" then
+            set_probes_enabled(false)
+        elseif value == "probes" then
+            set_probes_enabled(true)
+        elseif value:match("^delay=") ~= nil then
+            local parsed = tonumber(value:match("^delay=(.+)$"))
+            if parsed ~= nil and parsed > 0 then
+                ephemeral.delay = parsed
+            end
+        end
+    end
+
+    local target, target_err = validate_ephemeral_target()
+    if target == nil then
+        write_probe("ephemeral_target", "REJECT", target_err, "")
+        print(chat.header("OddOrg") .. chat.error(target_err or "invalid Ephemeral Moogle target"))
+        return
+    end
+
+    local queue, summary, queue_err = build_ephemeral_dump_queue(options)
+    if queue == nil then
+        write_probe("ephemeral_plan_done", "REJECT", queue_err, options.scope)
+        print(chat.header("OddOrg") .. chat.error(queue_err or "ephemeral dump plan failed"))
+        return
+    end
+
+    if #queue == 0 then
+        write_probe("ephemeral_queue_start", "OK", "no crystals or clusters found", options.scope)
+        say("no crystals or clusters found for ephemeral dump.")
+        return
+    end
+
+    ephemeral.running = true
+    ephemeral.queue = queue
+    ephemeral.cursor = 1
+    ephemeral.last_send = 0
+    ephemeral.scope = options.scope
+    ephemeral.started_at = os.clock()
+    ephemeral.error = nil
+    ephemeral.target = target
+    ephemeral.summary = summary
+    ephemeral.awaiting_inventory = nil
+    ephemeral.animation_wait_until = nil
+    ephemeral.animation_wait_last_probe = 0
+    ui.visible = true
+    ui.scope = "crystals"
+
+    write_probe(
+        "ephemeral_queue_start",
+        "OK",
+        "ephemeral dump queue started",
+        ("scope=%s queue=%u trades=%u stage=%u units=%u cap_per_element=%u target=%u batch_size=%u animation_wait=%u"):format(
+            options.scope,
+            #queue,
+            summary.trades,
+            summary.stage_moves,
+            summary.units,
+            EPHEMERAL_UNIT_CAP,
+            target.server_id,
+            EPHEMERAL_TRADE_BATCH_SIZE,
+            EPHEMERAL_TRADE_ANIMATION_DELAY
+        )
+    )
+    say(("ephemeral dump started: trades=%u stage=%u units=%u batch=%u animation_wait=%us delay=%.2fs"):format(
+        summary.trades,
+        summary.stage_moves,
+        summary.units,
+        EPHEMERAL_TRADE_BATCH_SIZE,
+        EPHEMERAL_TRADE_ANIMATION_DELAY,
+        ephemeral.delay
+    ))
+end
+
+local function run_ephemeral_tick()
+    if not ephemeral.running then
+        return
+    end
+
+    local now = os.clock()
+
+    if ephemeral.animation_wait_until ~= nil then
+        local remaining = ephemeral.animation_wait_until - os.time()
+        if remaining > 0 then
+            if ephemeral.animation_wait_last_probe == 0 or os.time() - ephemeral.animation_wait_last_probe >= 5 then
+                ephemeral.animation_wait_last_probe = os.time()
+                write_probe(
+                    "ephemeral_trade_animation_wait",
+                    "WAIT",
+                    "waiting for Ephemeral Moogle trade animation",
+                    ("remaining=%us"):format(remaining)
+                )
+            end
+            return
+        end
+
+        write_probe("ephemeral_trade_animation_wait", "OK", "animation wait complete", "continuing")
+        ephemeral.animation_wait_until = nil
+        ephemeral.animation_wait_last_probe = 0
+    end
+
+    if ephemeral.cursor > #ephemeral.queue then
+        ephemeral.running = false
+        ephemeral.awaiting_inventory = nil
+        write_probe("ephemeral_queue_done", "OK", "ephemeral dump queue complete", ("sent=%u"):format(#ephemeral.queue))
+        say("ephemeral dump queue complete.")
+        return
+    end
+
+    if ephemeral.last_send ~= 0 and (now - ephemeral.last_send) < ephemeral.delay then
+        return
+    end
+
+    if not wait_for_ephemeral_inventory_stage(now) then
+        return
+    end
+
+    local action = ephemeral.queue[ephemeral.cursor]
+    if action == nil then
+        stop_ephemeral("ephemeral queue cursor missing")
+        write_probe("ephemeral_queue_step", "REJECT", "queue cursor missing", tostring(ephemeral.cursor))
+        return
+    end
+
+    if action.kind == "stage" then
+        local stage_move = action.stage_move
+        local ok, message, details = validate_move(stage_move)
+        if not ok then
+            stop_ephemeral(message)
+            fail_move(stage_move.move_id, message, details)
+            say("ephemeral dump stopped on staging reject at " .. tostring(ephemeral.cursor) .. ".")
+            return
+        end
+
+        send_move_packet(stage_move)
+        write_audit(stage_move.move_id, "SENT", message, details)
+        write_probe(
+            "ephemeral_queue_step",
+            "SENT",
+            stage_move.move_id,
+            ("%u/%u stage %s"):format(ephemeral.cursor, #ephemeral.queue, move_to_command_label(stage_move))
+        )
+        ephemeral.awaiting_inventory = {
+            stage_move_id = stage_move.move_id,
+            trade_move_id = action.trade_move_id,
+            item_id = stage_move.item_id,
+            quantity = stage_move.quantity,
+            item_name = stage_move.item_name,
+            stack_size = stage_move.stack_size,
+            started_at = os.clock(),
+            last_probe = 0,
+        }
+        write_probe(
+            "ephemeral_wait_inventory",
+            "OK",
+            "waiting for staged crystal or cluster in Inventory",
+            ("%s -> %s %s x%u"):format(stage_move.move_id, action.trade_move_id, stage_move.item_name, stage_move.quantity)
+        )
+        ephemeral.cursor = ephemeral.cursor + 1
+        ephemeral.last_send = now
+        return
+    end
+
+    if action.kind ~= "trade" then
+        stop_ephemeral("unknown ephemeral queue action")
+        write_probe("ephemeral_queue_step", "REJECT", "unknown action", tostring(action.kind))
+        return
+    end
+
+    local target, target_err = validate_ephemeral_target()
+    if target == nil then
+        stop_ephemeral(target_err)
+        write_audit(action.move_id, "REJECT", target_err, "target")
+        write_probe("ephemeral_target", "REJECT", target_err, "")
+        say("ephemeral dump stopped: " .. tostring(target_err))
+        return
+    end
+
+    local batch, _, batch_err, batch_details = build_ephemeral_trade_batch(ephemeral.cursor)
+    if batch == nil then
+        stop_ephemeral(batch_err)
+        write_audit(action.move_id, "REJECT", batch_err, batch_details)
+        write_probe("ephemeral_queue_step", "REJECT", batch_err, batch_details)
+        say("ephemeral dump stopped on trade reject at " .. tostring(ephemeral.cursor) .. ".")
+        return
+    end
+
+    send_ephemeral_trade_packet(target, batch.entries)
+    for _, entry in ipairs(batch.entries) do
+        write_audit(
+            entry.move_id,
+            "SENT",
+            "sent ephemeral trade batch",
+            ("Inventory[%u] %s x%u units=%u batch_size=%u"):format(
+                entry.source_index,
+                entry.item_name,
+                entry.quantity,
+                entry.units,
+                #batch.entries
+            )
+        )
+    end
+    write_probe(
+        "ephemeral_queue_step",
+        "SENT",
+        batch.move_id,
+        ("%u/%u trade_batch stacks=%u units=%u wait=%us"):format(
+            ephemeral.cursor,
+            #ephemeral.queue,
+            #batch.entries,
+            batch.units,
+            EPHEMERAL_TRADE_ANIMATION_DELAY
+        )
+    )
+    ephemeral.cursor = batch.next_cursor
+    ephemeral.animation_wait_until = os.time() + EPHEMERAL_TRADE_ANIMATION_DELAY
+    ephemeral.animation_wait_last_probe = 0
+    ephemeral.last_send = now
 end
 
 local function run_organizer_tick()
@@ -1847,23 +2641,253 @@ local function run_organizer_tick()
 end
 
 local function print_help()
-    say("Commands: /oddorg status | /oddorg move <move_id> <character_slug> <item_id> <quantity> <src_container_id> <src_index> <dst_container_id> \"<name>\" | /oddorg organize preview|run|stop|status [all|wardrobes|storage] [equipped] [social] | /oddorg probes on|off|clear|status")
+    say("Commands: /oddorg status | /oddorg move <move_id> <character_slug> <item_id> <quantity> <src_container_id> <src_index> <dst_container_id> \"<name>\" | /oddorg organize preview|run|stop|status [all|wardrobes|storage] [equipped] [social] | /oddorg ephemeral dump|stop|status [all|inventory|storage] | /oddorg probes on|off|clear|status")
 end
 
 local function handle_status()
     local slug = get_player_slug()
     write_audit("status", "OK", "loaded", slug)
     write_probe("queue_status", "OK", "addon status", slug)
-    say("loaded for " .. slug)
+    say(("loaded for %s organizer=%s ephemeral=%s"):format(slug, tostring(organizer.running), tostring(ephemeral.running)))
+end
+
+-- Keep the GUI self-contained while matching OddQ's dark, cyan-accented skin.
+local UI_COLORS = {
+    background = { 0.063, 0.067, 0.067, 1.00 },
+    panel = { 0.094, 0.102, 0.102, 1.00 },
+    transparent = { 0.000, 0.000, 0.000, 0.00 },
+    text = { 0.933, 0.914, 0.863, 1.00 },
+    muted = { 0.700, 0.745, 0.745, 1.00 },
+    blue = { 0.059, 0.541, 0.862, 0.62 },
+    blue_outline = { 0.059, 0.541, 0.862, 0.90 },
+    blue_highlight = { 0.098, 0.858, 1.000, 1.00 },
+    progress_track = { 0.933, 0.914, 0.863, 0.22 },
+}
+
+local function global(name)
+    return _G ~= nil and _G[name] or nil
+end
+
+local function push_ui_color(slot_name, color, pushed)
+    local slot = global(slot_name)
+    if imgui ~= nil and imgui.PushStyleColor ~= nil and slot ~= nil then
+        imgui.PushStyleColor(slot, color)
+        pushed.colors = pushed.colors + 1
+    end
+end
+
+local function push_ui_var(slot_name, value, pushed)
+    local slot = global(slot_name)
+    if imgui ~= nil and imgui.PushStyleVar ~= nil and slot ~= nil then
+        imgui.PushStyleVar(slot, value)
+        pushed.vars = pushed.vars + 1
+    end
+end
+
+local function push_ui_style()
+    local pushed = { colors = 0, vars = 0 }
+    if imgui.SetNextWindowBgAlpha ~= nil then
+        imgui.SetNextWindowBgAlpha(0.93)
+    end
+    push_ui_color("ImGuiCol_Text", UI_COLORS.text, pushed)
+    push_ui_color("ImGuiCol_WindowBg", UI_COLORS.background, pushed)
+    push_ui_color("ImGuiCol_TitleBg", UI_COLORS.transparent, pushed)
+    push_ui_color("ImGuiCol_TitleBgActive", UI_COLORS.transparent, pushed)
+    push_ui_color("ImGuiCol_TitleBgCollapsed", UI_COLORS.transparent, pushed)
+    push_ui_color("ImGuiCol_Button", UI_COLORS.panel, pushed)
+    push_ui_color("ImGuiCol_ButtonHovered", UI_COLORS.blue, pushed)
+    push_ui_color("ImGuiCol_ButtonActive", UI_COLORS.blue_highlight, pushed)
+    push_ui_var("ImGuiStyleVar_WindowRounding", 10.0, pushed)
+    push_ui_var("ImGuiStyleVar_FrameRounding", 5.0, pushed)
+    push_ui_var("ImGuiStyleVar_ItemSpacing", { 8.0, 6.0 }, pushed)
+    push_ui_var("ImGuiStyleVar_FramePadding", { 4.0, 5.0 }, pushed)
+    return pushed
+end
+
+local function pop_ui_style(pushed)
+    if imgui.PopStyleVar ~= nil and pushed.vars > 0 then
+        imgui.PopStyleVar(pushed.vars)
+    end
+    if imgui.PopStyleColor ~= nil and pushed.colors > 0 then
+        imgui.PopStyleColor(pushed.colors)
+    end
+end
+
+local function ui_text(value, color)
+    local pushed = { colors = 0, vars = 0 }
+    if color ~= nil then
+        push_ui_color("ImGuiCol_Text", color, pushed)
+    end
+    if imgui.TextUnformatted ~= nil then
+        imgui.TextUnformatted(tostring(value or ""))
+    elseif imgui.Text ~= nil then
+        imgui.Text(tostring(value or ""))
+    end
+    pop_ui_style(pushed)
+end
+
+local function ui_button(label, active, disabled, outlined_when_inactive)
+    local pushed = { colors = 0, vars = 0 }
+    if active then
+        push_ui_color("ImGuiCol_Button", UI_COLORS.blue, pushed)
+    elseif outlined_when_inactive then
+        push_ui_color("ImGuiCol_Border", UI_COLORS.blue_outline, pushed)
+        push_ui_var("ImGuiStyleVar_FrameBorderSize", 1.0, pushed)
+    end
+    local used_disabled = disabled and imgui.BeginDisabled ~= nil and imgui.EndDisabled ~= nil
+    if used_disabled then
+        imgui.BeginDisabled(true)
+    end
+    local clicked = imgui.Button ~= nil and imgui.Button(label) == true
+    if used_disabled then
+        imgui.EndDisabled()
+    end
+    pop_ui_style(pushed)
+    return not disabled and clicked
+end
+
+local function same_line()
+    if imgui.SameLine ~= nil then
+        imgui.SameLine()
+    end
+end
+
+local function active_progress_state()
+    if organizer.running then
+        return organizer
+    end
+    if ephemeral.running then
+        return ephemeral
+    end
+    return nil
+end
+
+local function progress_fraction(state)
+    local total = #(state.queue or {})
+    if total == 0 then
+        return 1.0
+    end
+    local completed = math.max(0, math.min(total, state.cursor - 1))
+    return completed / total
+end
+
+local function render_micro_progress()
+    local state = active_progress_state()
+    if state == nil then
+        return
+    end
+
+    local width = 220.0
+    if imgui.GetWindowWidth ~= nil then
+        width = math.max(80.0, (tonumber(imgui.GetWindowWidth()) or 252.0) - 32.0)
+    end
+    local fraction = progress_fraction(state)
+    if imgui.GetWindowDrawList ~= nil and imgui.GetCursorScreenPos ~= nil and imgui.Dummy ~= nil then
+        local draw = imgui.GetWindowDrawList()
+        if draw ~= nil and draw.AddRectFilled ~= nil then
+            local x, y = imgui.GetCursorScreenPos()
+            local track = imgui.GetColorU32 ~= nil and imgui.GetColorU32(UI_COLORS.progress_track) or UI_COLORS.progress_track
+            local fill = imgui.GetColorU32 ~= nil and imgui.GetColorU32(UI_COLORS.blue_highlight) or UI_COLORS.blue_highlight
+            draw:AddRectFilled({ x, y }, { x + width, y + 3.0 }, track, 999.0)
+            draw:AddRectFilled({ x, y }, { x + (width * fraction), y + 3.0 }, fill, 999.0)
+            imgui.Dummy({ width, 3.0 })
+            return
+        end
+    end
+    if imgui.ProgressBar ~= nil then
+        imgui.ProgressBar(fraction, { width, 3.0 }, "")
+    end
+end
+
+local function render_ui()
+    if imgui == nil or ui.visible ~= true or imgui.Begin == nil or imgui.End == nil then
+        return
+    end
+
+    if imgui.SetNextWindowSize ~= nil then
+        imgui.SetNextWindowSize({ 300.0, 175.0 }, global("ImGuiCond_FirstUseEver") or 0)
+    end
+    local pushed = push_ui_style()
+    local open = { true }
+    local visible = imgui.Begin("OddOrg", open, 0)
+    ui.visible = open[1] == true
+
+    if visible == true then
+        local busy = organizer.running or ephemeral.running
+        local crystals_selected = ui.scope == "crystals"
+        ui_text(crystals_selected and "Trade crystals" or "Organize storage", UI_COLORS.blue_highlight)
+        ui_text(
+            crystals_selected and "Target an Ephemeral Moogle first." or "Mog House only. Unequip gear first.",
+            UI_COLORS.muted
+        )
+        ui_text("Mode", UI_COLORS.muted)
+
+        if ui_button("All##oddorg_scope_all", ui.scope == "all", busy, true) then
+            ui.scope = "all"
+        end
+        same_line()
+        if ui_button("Wardrobes##oddorg_scope_wardrobes", ui.scope == "wardrobes", busy, true) then
+            ui.scope = "wardrobes"
+        end
+        same_line()
+        if ui_button("Storage##oddorg_scope_storage", ui.scope == "storage", busy, true) then
+            ui.scope = "storage"
+        end
+        same_line()
+        if ui_button("Crystals##oddorg_mode_crystals", crystals_selected, busy, true) then
+            ui.scope = "crystals"
+            crystals_selected = true
+        end
+
+        if crystals_selected then
+            if ui_button("Trade##oddorg_crystals_dump", true, busy) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "dump", "all" })
+            end
+            same_line()
+            if ui_button("Stop##oddorg_crystals_stop", false, not ephemeral.running) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "stop" })
+            end
+            same_line()
+            if ui_button("Status##oddorg_crystals_status", false, false) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "status" })
+            end
+        else
+            if ui_button("Preview##oddorg_preview", false, busy) then
+                handle_organize({ "/oddorg", "organize", "preview", ui.scope })
+            end
+            same_line()
+            if ui_button("Organize##oddorg_run", true, busy) then
+                handle_organize({ "/oddorg", "organize", "run", ui.scope })
+            end
+            same_line()
+            if ui_button("Stop##oddorg_stop", false, not organizer.running) then
+                handle_organize({ "/oddorg", "organize", "stop" })
+            end
+            same_line()
+            if ui_button("Status##oddorg_status", false, false) then
+                handle_organize({ "/oddorg", "organize", "status" })
+            end
+        end
+
+        render_micro_progress()
+    end
+
+    imgui.End()
+    pop_ui_style(pushed)
 end
 
 ashita.events.register("command", "oddorg_command", function(e)
     local args = e.command:args()
-    if #args == 0 or args[1] ~= "/oddorg" then
+    if #args == 0 or string.lower(args[1] or "") ~= "/oddorg" then
         return
     end
 
     e.blocked = true
+
+    if #args == 1 then
+        ui.visible = true
+        return
+    end
 
     if args[2] == "move" then
         handle_move(args)
@@ -1880,6 +2904,11 @@ ashita.events.register("command", "oddorg_command", function(e)
         return
     end
 
+    if args[2] == "ephemeral" then
+        handle_ephemeral(args)
+        return
+    end
+
     if args[2] == "status" then
         handle_status()
         return
@@ -1890,10 +2919,12 @@ end)
 
 ashita.events.register("d3d_present", "oddorg_organizer_tick", function()
     run_organizer_tick()
+    run_ephemeral_tick()
+    render_ui()
 end)
 
 ashita.events.register("load", "oddorg_load", function()
     write_audit("load", "OK", "loaded", get_player_slug())
     write_probe("probe_state", "OK", "loaded", "probes=" .. tostring(PROBES_ENABLED))
-    say("loaded. Use /oddorg status.")
+    say("loaded. Use /oddorg to open the organizer.")
 end)
