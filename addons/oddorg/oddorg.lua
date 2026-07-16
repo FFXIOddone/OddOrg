@@ -1,6 +1,6 @@
 addon.name = "oddorg"
 addon.author = "Odd"
-addon.version = "0.4.0"
+addon.version = "0.5.0-rc1"
 addon.desc = "Guarded in-addon storage organization mover."
 
 require("common")
@@ -2419,6 +2419,8 @@ local function handle_ephemeral(args)
     ephemeral.awaiting_inventory = nil
     ephemeral.animation_wait_until = nil
     ephemeral.animation_wait_last_probe = 0
+    ui.visible = true
+    ui.scope = "crystals"
 
     write_probe(
         "ephemeral_queue_start",
@@ -2653,9 +2655,11 @@ end
 local UI_COLORS = {
     background = { 0.063, 0.067, 0.067, 1.00 },
     panel = { 0.094, 0.102, 0.102, 1.00 },
+    transparent = { 0.000, 0.000, 0.000, 0.00 },
     text = { 0.933, 0.914, 0.863, 1.00 },
     muted = { 0.700, 0.745, 0.745, 1.00 },
     blue = { 0.059, 0.541, 0.862, 0.62 },
+    blue_outline = { 0.059, 0.541, 0.862, 0.90 },
     blue_highlight = { 0.098, 0.858, 1.000, 1.00 },
     progress_track = { 0.933, 0.914, 0.863, 0.22 },
 }
@@ -2687,8 +2691,9 @@ local function push_ui_style()
     end
     push_ui_color("ImGuiCol_Text", UI_COLORS.text, pushed)
     push_ui_color("ImGuiCol_WindowBg", UI_COLORS.background, pushed)
-    push_ui_color("ImGuiCol_TitleBg", UI_COLORS.panel, pushed)
-    push_ui_color("ImGuiCol_TitleBgActive", UI_COLORS.panel, pushed)
+    push_ui_color("ImGuiCol_TitleBg", UI_COLORS.transparent, pushed)
+    push_ui_color("ImGuiCol_TitleBgActive", UI_COLORS.transparent, pushed)
+    push_ui_color("ImGuiCol_TitleBgCollapsed", UI_COLORS.transparent, pushed)
     push_ui_color("ImGuiCol_Button", UI_COLORS.panel, pushed)
     push_ui_color("ImGuiCol_ButtonHovered", UI_COLORS.blue, pushed)
     push_ui_color("ImGuiCol_ButtonActive", UI_COLORS.blue_highlight, pushed)
@@ -2721,10 +2726,13 @@ local function ui_text(value, color)
     pop_ui_style(pushed)
 end
 
-local function ui_button(label, active, disabled)
+local function ui_button(label, active, disabled, outlined_when_inactive)
     local pushed = { colors = 0, vars = 0 }
     if active then
         push_ui_color("ImGuiCol_Button", UI_COLORS.blue, pushed)
+    elseif outlined_when_inactive then
+        push_ui_color("ImGuiCol_Border", UI_COLORS.blue_outline, pushed)
+        push_ui_var("ImGuiStyleVar_FrameBorderSize", 1.0, pushed)
     end
     local used_disabled = disabled and imgui.BeginDisabled ~= nil and imgui.EndDisabled ~= nil
     if used_disabled then
@@ -2744,17 +2752,28 @@ local function same_line()
     end
 end
 
-local function progress_fraction()
-    local total = #organizer.queue
+local function active_progress_state()
+    if organizer.running then
+        return organizer
+    end
+    if ephemeral.running then
+        return ephemeral
+    end
+    return nil
+end
+
+local function progress_fraction(state)
+    local total = #(state.queue or {})
     if total == 0 then
         return 1.0
     end
-    local completed = math.max(0, math.min(total, organizer.cursor - 1))
+    local completed = math.max(0, math.min(total, state.cursor - 1))
     return completed / total
 end
 
 local function render_micro_progress()
-    if not organizer.running then
+    local state = active_progress_state()
+    if state == nil then
         return
     end
 
@@ -2762,7 +2781,7 @@ local function render_micro_progress()
     if imgui.GetWindowWidth ~= nil then
         width = math.max(80.0, (tonumber(imgui.GetWindowWidth()) or 252.0) - 32.0)
     end
-    local fraction = progress_fraction()
+    local fraction = progress_fraction(state)
     if imgui.GetWindowDrawList ~= nil and imgui.GetCursorScreenPos ~= nil and imgui.Dummy ~= nil then
         local draw = imgui.GetWindowDrawList()
         if draw ~= nil and draw.AddRectFilled ~= nil then
@@ -2795,36 +2814,59 @@ local function render_ui()
 
     if visible == true then
         local busy = organizer.running or ephemeral.running
-        ui_text("Organize storage", UI_COLORS.blue_highlight)
-        ui_text("Mog House only. Unequip gear first.", UI_COLORS.muted)
-        ui_text("Scope", UI_COLORS.muted)
+        local crystals_selected = ui.scope == "crystals"
+        ui_text(crystals_selected and "Trade crystals" or "Organize storage", UI_COLORS.blue_highlight)
+        ui_text(
+            crystals_selected and "Target an Ephemeral Moogle first." or "Mog House only. Unequip gear first.",
+            UI_COLORS.muted
+        )
+        ui_text("Mode", UI_COLORS.muted)
 
-        if ui_button("All##oddorg_scope_all", ui.scope == "all", busy) then
+        if ui_button("All##oddorg_scope_all", ui.scope == "all", busy, true) then
             ui.scope = "all"
         end
         same_line()
-        if ui_button("Wardrobes##oddorg_scope_wardrobes", ui.scope == "wardrobes", busy) then
+        if ui_button("Wardrobes##oddorg_scope_wardrobes", ui.scope == "wardrobes", busy, true) then
             ui.scope = "wardrobes"
         end
         same_line()
-        if ui_button("Storage##oddorg_scope_storage", ui.scope == "storage", busy) then
+        if ui_button("Storage##oddorg_scope_storage", ui.scope == "storage", busy, true) then
             ui.scope = "storage"
         end
+        same_line()
+        if ui_button("Crystals##oddorg_mode_crystals", crystals_selected, busy, true) then
+            ui.scope = "crystals"
+            crystals_selected = true
+        end
 
-        if ui_button("Preview##oddorg_preview", false, busy) then
-            handle_organize({ "/oddorg", "organize", "preview", ui.scope })
-        end
-        same_line()
-        if ui_button("Organize##oddorg_run", true, busy) then
-            handle_organize({ "/oddorg", "organize", "run", ui.scope })
-        end
-        same_line()
-        if ui_button("Stop##oddorg_stop", false, not organizer.running) then
-            handle_organize({ "/oddorg", "organize", "stop" })
-        end
-        same_line()
-        if ui_button("Status##oddorg_status", false, false) then
-            handle_organize({ "/oddorg", "organize", "status" })
+        if crystals_selected then
+            if ui_button("Trade##oddorg_crystals_dump", true, busy) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "dump", "all" })
+            end
+            same_line()
+            if ui_button("Stop##oddorg_crystals_stop", false, not ephemeral.running) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "stop" })
+            end
+            same_line()
+            if ui_button("Status##oddorg_crystals_status", false, false) then
+                handle_ephemeral({ "/oddorg", "ephemeral", "status" })
+            end
+        else
+            if ui_button("Preview##oddorg_preview", false, busy) then
+                handle_organize({ "/oddorg", "organize", "preview", ui.scope })
+            end
+            same_line()
+            if ui_button("Organize##oddorg_run", true, busy) then
+                handle_organize({ "/oddorg", "organize", "run", ui.scope })
+            end
+            same_line()
+            if ui_button("Stop##oddorg_stop", false, not organizer.running) then
+                handle_organize({ "/oddorg", "organize", "stop" })
+            end
+            same_line()
+            if ui_button("Status##oddorg_status", false, false) then
+                handle_organize({ "/oddorg", "organize", "status" })
+            end
         end
 
         render_micro_progress()

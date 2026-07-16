@@ -11,8 +11,9 @@ Copy `addons/oddorg` into your Ashita `addons` folder, then load it in game:
 ```
 
 Open the button UI with `/oddorg`. The addon stays closed when loaded and only
-opens when requested. Pick a scope, then preview or run the organizer. A tiny
-progress bar is shown while organization is running.
+opens when requested. Pick an organization scope, or choose **Crystals** to
+trade crystals and clusters to a targeted Ephemeral Moogle. A tiny progress bar
+is shown while either queue is running.
 
 ## Commands
 
@@ -22,6 +23,9 @@ progress bar is shown while organization is running.
 /oddorg organize run all
 /oddorg organize stop
 /oddorg organize status
+/oddorg ephemeral dump all
+/oddorg ephemeral stop
+/oddorg ephemeral status
 /oddorg probes on
 /oddorg probes off
 /oddorg probes clear
@@ -29,5 +33,8 @@ progress bar is shown while organization is running.
 ```
 
 Scopes: `all`, `wardrobes`, or `storage`.
+
+Crystal scopes: `all`, `inventory`, or `storage`. Target an Ephemeral Moogle
+before starting a crystal dump.
 
 Options: `equipped`, `social`, `delay=0.8`, `probes`, `noprobes`.
