@@ -1,6 +1,6 @@
 addon.name = "oddorg"
 addon.author = "Odd"
-addon.version = "0.5.0-rc1"
+addon.version = "1.0.0"
 addon.desc = "Guarded in-addon storage organization mover."
 
 require("common")

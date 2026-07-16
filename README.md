@@ -2,7 +2,12 @@
 
 ## Use
 
-Use `oddorg` in a Mog House while naked. Remove equipped gear first so equipment can be organized, and make sure the storage tabs you want to use are accessible.
+For storage organization, use `oddorg` in a Mog House while naked. Remove
+equipped gear first so equipment can be organized, and make sure the storage
+tabs you want to use are accessible.
+
+For crystal trading, target a nearby Ephemeral Moogle before choosing
+**Crystals** in the UI or running an `ephemeral dump` command.
 
 Copy `addons/oddorg` into your Ashita `addons` folder, then load it in game:
 
