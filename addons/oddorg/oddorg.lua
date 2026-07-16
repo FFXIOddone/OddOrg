@@ -1,11 +1,15 @@
 addon.name = "oddorg"
 addon.author = "Odd"
-addon.version = "0.3.0"
+addon.version = "0.4.0"
 addon.desc = "Guarded in-addon storage organization mover."
 
 require("common")
 local bit = require("bit")
 local chat = require("chat")
+local imgui_ok, imgui = pcall(require, "imgui")
+if not imgui_ok then
+    imgui = nil
+end
 
 local MOVE_PACKET_ID = 0x029
 local EPHEMERAL_TRADE_PACKET_ID = 0x036
@@ -157,6 +161,11 @@ local ephemeral = {
     awaiting_inventory = nil,
     animation_wait_until = nil,
     animation_wait_last_probe = 0,
+}
+
+local ui = {
+    visible = false,
+    scope = "all",
 }
 
 local bag_access_pointer = nil
@@ -1581,7 +1590,7 @@ end
 
 local function parse_organize_options(args)
     local options = {
-        action = args[3] or "status",
+        action = string.lower(args[3] or "status"),
         scope = "all",
         allow_equipped = false,
         include_social = false,
@@ -1786,6 +1795,11 @@ local function handle_organize(args)
         return
     end
 
+    if ephemeral.running then
+        say("ephemeral dump is running; stop it before organizing storage.")
+        return
+    end
+
     local plan, queue, err = build_preview_or_queue(options)
     if plan == nil then
         write_probe("plan_done", "REJECT", err, options.scope)
@@ -1810,6 +1824,7 @@ local function handle_organize(args)
         logical = #plan.logical_moves,
         physical = #queue,
     }
+    ui.visible = true
     write_probe("queue_start", "OK", "organization queue started", ("scope=%s physical=%u"):format(options.scope, #queue))
     say(("organizer started: logical=%u physical=%u delay=%.2fs"):format(#plan.logical_moves, #queue, organizer.delay))
 end
@@ -2634,13 +2649,203 @@ local function handle_status()
     say(("loaded for %s organizer=%s ephemeral=%s"):format(slug, tostring(organizer.running), tostring(ephemeral.running)))
 end
 
+-- Keep the GUI self-contained while matching OddQ's dark, cyan-accented skin.
+local UI_COLORS = {
+    background = { 0.063, 0.067, 0.067, 1.00 },
+    panel = { 0.094, 0.102, 0.102, 1.00 },
+    text = { 0.933, 0.914, 0.863, 1.00 },
+    muted = { 0.700, 0.745, 0.745, 1.00 },
+    blue = { 0.059, 0.541, 0.862, 0.62 },
+    blue_highlight = { 0.098, 0.858, 1.000, 1.00 },
+    progress_track = { 0.933, 0.914, 0.863, 0.22 },
+}
+
+local function global(name)
+    return _G ~= nil and _G[name] or nil
+end
+
+local function push_ui_color(slot_name, color, pushed)
+    local slot = global(slot_name)
+    if imgui ~= nil and imgui.PushStyleColor ~= nil and slot ~= nil then
+        imgui.PushStyleColor(slot, color)
+        pushed.colors = pushed.colors + 1
+    end
+end
+
+local function push_ui_var(slot_name, value, pushed)
+    local slot = global(slot_name)
+    if imgui ~= nil and imgui.PushStyleVar ~= nil and slot ~= nil then
+        imgui.PushStyleVar(slot, value)
+        pushed.vars = pushed.vars + 1
+    end
+end
+
+local function push_ui_style()
+    local pushed = { colors = 0, vars = 0 }
+    if imgui.SetNextWindowBgAlpha ~= nil then
+        imgui.SetNextWindowBgAlpha(0.93)
+    end
+    push_ui_color("ImGuiCol_Text", UI_COLORS.text, pushed)
+    push_ui_color("ImGuiCol_WindowBg", UI_COLORS.background, pushed)
+    push_ui_color("ImGuiCol_TitleBg", UI_COLORS.panel, pushed)
+    push_ui_color("ImGuiCol_TitleBgActive", UI_COLORS.panel, pushed)
+    push_ui_color("ImGuiCol_Button", UI_COLORS.panel, pushed)
+    push_ui_color("ImGuiCol_ButtonHovered", UI_COLORS.blue, pushed)
+    push_ui_color("ImGuiCol_ButtonActive", UI_COLORS.blue_highlight, pushed)
+    push_ui_var("ImGuiStyleVar_WindowRounding", 10.0, pushed)
+    push_ui_var("ImGuiStyleVar_FrameRounding", 5.0, pushed)
+    push_ui_var("ImGuiStyleVar_ItemSpacing", { 8.0, 6.0 }, pushed)
+    push_ui_var("ImGuiStyleVar_FramePadding", { 4.0, 5.0 }, pushed)
+    return pushed
+end
+
+local function pop_ui_style(pushed)
+    if imgui.PopStyleVar ~= nil and pushed.vars > 0 then
+        imgui.PopStyleVar(pushed.vars)
+    end
+    if imgui.PopStyleColor ~= nil and pushed.colors > 0 then
+        imgui.PopStyleColor(pushed.colors)
+    end
+end
+
+local function ui_text(value, color)
+    local pushed = { colors = 0, vars = 0 }
+    if color ~= nil then
+        push_ui_color("ImGuiCol_Text", color, pushed)
+    end
+    if imgui.TextUnformatted ~= nil then
+        imgui.TextUnformatted(tostring(value or ""))
+    elseif imgui.Text ~= nil then
+        imgui.Text(tostring(value or ""))
+    end
+    pop_ui_style(pushed)
+end
+
+local function ui_button(label, active, disabled)
+    local pushed = { colors = 0, vars = 0 }
+    if active then
+        push_ui_color("ImGuiCol_Button", UI_COLORS.blue, pushed)
+    end
+    local used_disabled = disabled and imgui.BeginDisabled ~= nil and imgui.EndDisabled ~= nil
+    if used_disabled then
+        imgui.BeginDisabled(true)
+    end
+    local clicked = imgui.Button ~= nil and imgui.Button(label) == true
+    if used_disabled then
+        imgui.EndDisabled()
+    end
+    pop_ui_style(pushed)
+    return not disabled and clicked
+end
+
+local function same_line()
+    if imgui.SameLine ~= nil then
+        imgui.SameLine()
+    end
+end
+
+local function progress_fraction()
+    local total = #organizer.queue
+    if total == 0 then
+        return 1.0
+    end
+    local completed = math.max(0, math.min(total, organizer.cursor - 1))
+    return completed / total
+end
+
+local function render_micro_progress()
+    if not organizer.running then
+        return
+    end
+
+    local width = 220.0
+    if imgui.GetWindowWidth ~= nil then
+        width = math.max(80.0, (tonumber(imgui.GetWindowWidth()) or 252.0) - 32.0)
+    end
+    local fraction = progress_fraction()
+    if imgui.GetWindowDrawList ~= nil and imgui.GetCursorScreenPos ~= nil and imgui.Dummy ~= nil then
+        local draw = imgui.GetWindowDrawList()
+        if draw ~= nil and draw.AddRectFilled ~= nil then
+            local x, y = imgui.GetCursorScreenPos()
+            local track = imgui.GetColorU32 ~= nil and imgui.GetColorU32(UI_COLORS.progress_track) or UI_COLORS.progress_track
+            local fill = imgui.GetColorU32 ~= nil and imgui.GetColorU32(UI_COLORS.blue_highlight) or UI_COLORS.blue_highlight
+            draw:AddRectFilled({ x, y }, { x + width, y + 3.0 }, track, 999.0)
+            draw:AddRectFilled({ x, y }, { x + (width * fraction), y + 3.0 }, fill, 999.0)
+            imgui.Dummy({ width, 3.0 })
+            return
+        end
+    end
+    if imgui.ProgressBar ~= nil then
+        imgui.ProgressBar(fraction, { width, 3.0 }, "")
+    end
+end
+
+local function render_ui()
+    if imgui == nil or ui.visible ~= true or imgui.Begin == nil or imgui.End == nil then
+        return
+    end
+
+    if imgui.SetNextWindowSize ~= nil then
+        imgui.SetNextWindowSize({ 300.0, 175.0 }, global("ImGuiCond_FirstUseEver") or 0)
+    end
+    local pushed = push_ui_style()
+    local open = { true }
+    local visible = imgui.Begin("OddOrg", open, 0)
+    ui.visible = open[1] == true
+
+    if visible == true then
+        local busy = organizer.running or ephemeral.running
+        ui_text("Organize storage", UI_COLORS.blue_highlight)
+        ui_text("Mog House only. Unequip gear first.", UI_COLORS.muted)
+        ui_text("Scope", UI_COLORS.muted)
+
+        if ui_button("All##oddorg_scope_all", ui.scope == "all", busy) then
+            ui.scope = "all"
+        end
+        same_line()
+        if ui_button("Wardrobes##oddorg_scope_wardrobes", ui.scope == "wardrobes", busy) then
+            ui.scope = "wardrobes"
+        end
+        same_line()
+        if ui_button("Storage##oddorg_scope_storage", ui.scope == "storage", busy) then
+            ui.scope = "storage"
+        end
+
+        if ui_button("Preview##oddorg_preview", false, busy) then
+            handle_organize({ "/oddorg", "organize", "preview", ui.scope })
+        end
+        same_line()
+        if ui_button("Organize##oddorg_run", true, busy) then
+            handle_organize({ "/oddorg", "organize", "run", ui.scope })
+        end
+        same_line()
+        if ui_button("Stop##oddorg_stop", false, not organizer.running) then
+            handle_organize({ "/oddorg", "organize", "stop" })
+        end
+        same_line()
+        if ui_button("Status##oddorg_status", false, false) then
+            handle_organize({ "/oddorg", "organize", "status" })
+        end
+
+        render_micro_progress()
+    end
+
+    imgui.End()
+    pop_ui_style(pushed)
+end
+
 ashita.events.register("command", "oddorg_command", function(e)
     local args = e.command:args()
-    if #args == 0 or args[1] ~= "/oddorg" then
+    if #args == 0 or string.lower(args[1] or "") ~= "/oddorg" then
         return
     end
 
     e.blocked = true
+
+    if #args == 1 then
+        ui.visible = true
+        return
+    end
 
     if args[2] == "move" then
         handle_move(args)
@@ -2673,10 +2878,11 @@ end)
 ashita.events.register("d3d_present", "oddorg_organizer_tick", function()
     run_organizer_tick()
     run_ephemeral_tick()
+    render_ui()
 end)
 
 ashita.events.register("load", "oddorg_load", function()
     write_audit("load", "OK", "loaded", get_player_slug())
     write_probe("probe_state", "OK", "loaded", "probes=" .. tostring(PROBES_ENABLED))
-    say("loaded. Use /oddorg status.")
+    say("loaded. Use /oddorg to open the organizer.")
 end)
