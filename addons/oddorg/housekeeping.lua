@@ -34,39 +34,59 @@ function policy.choose(snapshot, reserved, config, character, destinations, allo
     for _, item in ipairs(snapshot.items) do
         local permitted = allowed and allowed(item)
         if allowed == nil then permitted = policy.allowed(config, item.item_id) end
+        local protected = reserved['0:' .. item.index] or 0
         if item.container_id == 0 and permitted
-            and (reserved['0:' .. item.index] or 0) == 0 and not item.locked
+            and protected < item.quantity and (protected == 0 or sort_all) and not item.locked
             and not item.equipped and not item.social then
-            candidates[#candidates + 1] = item
+            local candidate = {}
+            for key,value in pairs(item) do candidate[key]=value end
+            candidate.quantity=item.quantity-protected
+            candidate.frees_slot=protected == 0
+            candidates[#candidates + 1] = candidate
         end
     end
-    -- Index destination room once per fresh snapshot, rather than rescanning
-    -- every stored item for each candidate, destination and preference pass.
-    local smallest_stack, routes = {}, {}
-    for _, stored in ipairs(snapshot.items) do
-        if not stored.locked then
-            local bag = smallest_stack[stored.container_id] or {}
-            smallest_stack[stored.container_id] = bag
-            bag[stored.item_id] = math.min(bag[stored.item_id] or stored.quantity, stored.quantity)
+    local function move_for(item,bag,quantity,stacking)
+        return {move_id='background-'..character..'-'..item.index,character_slug=character,
+            item_id=item.item_id,item_name=item.item_name,quantity=quantity,
+            source_container_id=0,source_index=item.index,target_container_id=bag,
+            stack_size=item.stack_size,frees_slot=item.frees_slot and quantity==item.quantity,
+            purpose=stacking and 'stack' or nil}
+    end
+    -- Existing partial stacks beat placement preferences. Only Inventory is a
+    -- source here: completed stored stacks never get relocated by automatic care.
+    local targets={}
+    for _,stored in ipairs(snapshot.items) do
+        if stored.container_id~=0 and not stored.locked and not stored.equipped and (tonumber(stored.flags) or 0)==0
+            and (stored.stack_size or 1)>stored.quantity
+            and (snapshot.capacities[stored.container_id] or 0)>0
+            and (not snapshot.stack_access or snapshot.stack_access[stored.container_id]~=false) then
+            targets[#targets+1]=stored
         end
     end
-    for _, item in ipairs(candidates) do
-        routes[item] = destinations and destinations(item) or { 5, 6, 7 }
-    end
-    for pass = 1, 2 do
-        for _, item in ipairs(candidates) do
-            for _, bag in ipairs(routes[item]) do
-                local count = smallest_stack[bag] and smallest_stack[bag][item.item_id]
-                local room = count and math.max(0, item.stack_size - count) or 0
-                local empty = (snapshot.capacities[bag] or 0) - (snapshot.counts[bag] or 0)
-                if (pass == 1 and room >= item.quantity) or (pass == 2 and empty > 0) then
-                    return {
-                        move_id='background-' .. character .. '-' .. item.index,
-                        character_slug=character, item_id=item.item_id, item_name=item.item_name,
-                        quantity=item.quantity, source_container_id=0, source_index=item.index,
-                        target_container_id=bag, stack_size=item.stack_size,
-                    }, 'moving', free
+    table.sort(targets,function(a,b)
+        if a.quantity~=b.quantity then return a.quantity>b.quantity end
+        if a.container_id~=b.container_id then return a.container_id<b.container_id end
+        return a.index<b.index
+    end)
+    for _,item in ipairs(candidates) do
+        for _,target in ipairs(targets) do
+            if item.item_id==target.item_id and item.item_name==target.item_name then
+                local room=math.max(0,math.min(item.stack_size,target.stack_size)-target.quantity)
+                local quantity=math.min(room,item.quantity)
+                local empty=(snapshot.capacities[target.container_id] or 0)-(snapshot.counts[target.container_id] or 0)
+                -- Native split transfers need an empty destination slot before
+                -- Auto Sort can combine them. Whole-source transfers can merge.
+                if quantity>0 and (empty>0 or (item.frees_slot and quantity==item.quantity)) then
+                    return move_for(item,target.container_id,quantity,true),'moving',free
                 end
+            end
+        end
+    end
+    for _,item in ipairs(candidates) do
+        local route=destinations and destinations(item) or {5,6,7}
+        for _,bag in ipairs(route) do
+            if (snapshot.capacities[bag] or 0)>(snapshot.counts[bag] or 0) then
+                return move_for(item,bag,item.quantity,false),'moving',free
             end
         end
     end

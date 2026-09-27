@@ -2,6 +2,7 @@
 -- This module has no Ashita, UI, filesystem, or transport access.
 local item_rules = {}
 local keep_rules = require('keep_rules')
+local storage_layout = require('storage_layout')
 
 local bags = { [1]=true,[2]=true,[4]=true,[5]=true,[6]=true,[7]=true,[8]=true,
     [9]=true,[10]=true,[11]=true,[12]=true,[13]=true,[14]=true,[15]=true,[16]=true }
@@ -227,6 +228,68 @@ function item_rules.refill_reservations(items, reserved, data)
     return result
 end
 
+-- Derived defaults are never written into the player's saved item rules.
+-- Count occupied and explicitly promised slots first, then fit one stack per
+-- supply type. Existing supplies win ties so repeated snapshots remain stable.
+function item_rules.with_default_supplies(snapshot, keep, data, overrides, layout, free_slots)
+    local reserved, err = item_rules.allocate(snapshot.items,keep,data,overrides)
+    if not reserved then return nil,err end
+    if layout and layout.active ~= '' then return data end
+    local result = {version=1,items={}}
+    for id,rule in pairs((data and data.items) or {}) do result.items[id]=rule end
+    local candidates, occupied, carried = {}, 0, {}
+    for _,item in ipairs(snapshot.items) do
+        local id, key = tostring(item.item_id), tostring(item.container_id)..':'..tostring(item.index)
+        local protected = reserved[key] or 0
+        local supply = storage_layout.supply_kind(item)
+        local eligible = supply and not result.items[id] and (keep[id] == nil or keep[id] == 0)
+            and storage_layout.target(layout,item) ~= false
+        if item.container_id == 0 then
+            carried[id] = (carried[id] or 0) + item.quantity
+            if not eligible or protected > 0 or item.locked or item.equipped or item.social then occupied=occupied+1 end
+        end
+        if eligible and item.container_id ~= 2 and not item.locked and not item.equipped
+            and (item.quantity > protected or (item.container_id == 0 and protected > 0)) then
+            local entry = candidates[id] or {id=id,stack=item.stack_size or 1,available=0,carried=false,protected=false}
+            entry.available=entry.available+item.quantity-(item.container_id == 0 and 0 or protected)
+            if item.container_id == 0 then
+                entry.carried=true
+                if protected > 0 then entry.protected=true end
+            end
+            candidates[id]=entry
+        end
+    end
+    local explicit_refill = item_rules.refill_reservations(snapshot.items,reserved,data)
+    local promised = {}
+    for _,item in ipairs(snapshot.items) do
+        local amount=explicit_refill[tostring(item.container_id)..':'..tostring(item.index)] or 0
+        local id=tostring(item.item_id)
+        if amount > 0 then
+            promised[id]=promised[id] or {quantity=0,stack=item.stack_size or 1}
+            promised[id].quantity=promised[id].quantity+amount
+        end
+    end
+    for id,entry in pairs(promised) do
+        local current=carried[id] or 0
+        occupied=occupied+math.max(0,math.ceil((current+entry.quantity)/entry.stack)-math.ceil(current/entry.stack))
+    end
+    local capacity=snapshot.capacities[0] or 0
+    local slots=math.max(0,capacity-math.min(capacity,free_slots or 5)-occupied)
+    local ordered={}
+    for _,entry in pairs(candidates) do ordered[#ordered+1]=entry end
+    table.sort(ordered,function(a,b)
+        if a.carried ~= b.carried then return a.carried end
+        return tonumber(a.id) < tonumber(b.id)
+    end)
+    for _,entry in ipairs(ordered) do
+        if entry.protected or slots > 0 then
+            result.items[entry.id]={carry_target=math.min(entry.stack,entry.available),destination='default',deposit=false}
+            if not entry.protected then slots=slots-1 end
+        end
+    end
+    return result
+end
+
 function item_rules.signature(data)
     local ok = item_rules.validate(data)
     if not ok then return nil end
@@ -261,6 +324,18 @@ function item_rules.record_manual_move(overrides, item_id, source, destination, 
     local to = tostring(destination)
     held[to] = math.min(99999, (tonumber(held[to]) or 0) + quantity)
     return true, quantity
+end
+
+function item_rules.record_manual_gain(overrides, item_id, location, quantity)
+    if type(overrides) ~= 'table' or not integer(item_id, 1, 65535)
+        or not valid_location(location) or not integer(quantity, 1, 99999) then
+        return false, 'Invalid confirmed manual item gain.'
+    end
+    local id, key = tostring(item_id), tostring(location)
+    if overrides[id] == true then return true end
+    overrides[id] = overrides[id] or {}
+    overrides[id][key] = math.min(99999, (tonumber(overrides[id][key]) or 0) + quantity)
+    return true
 end
 
 function item_rules.consume_override(overrides, item_id, location, quantity)

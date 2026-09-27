@@ -1,6 +1,6 @@
 addon.name = "oddorg"
 addon.author = "Odd"
-addon.version = "1.11.0"
+addon.version = "1.12.0"
 addon.desc = "Keep inventory space free, protect carried items, and deposit surplus crystals."
 
 require("common")
@@ -33,7 +33,7 @@ local EPHEMERAL_TRADE_ANIMATION_DELAY = 10
 local EPHEMERAL_UNIT_CAP = 5000
 local DESTINATION_AUTO_INDEX = 0x52
 local INVENTORY_CONTAINER_ID = 0
-local PROBES_ENABLED = true
+local PROBES_ENABLED = false
 local STACKING_IS_LIVE_VALIDATION_ONLY = true
 local ASSUME_UNVERIFIED_OPTIONAL_CONTAINERS = false
 local BAG_ACCESS_SIGNATURE = "A1????????8B88B4000000C1E907F6C101E9"
@@ -117,17 +117,6 @@ local WARDROBE_BUCKETS = {
     { container_id = 14, label = "Wardrobe6", description = "remaining hands and first legs", categories = { "hands", "legs" } },
     { container_id = 15, label = "Wardrobe7", description = "remaining legs, feet, and utility overflow", categories = { "legs", "feet", "waist", "neck", "ear", "back" } },
     { container_id = 16, label = "Wardrobe8", description = "rings and remaining earrings", categories = { "ring", "ear" } },
-}
-
-local STORAGE_BUCKETS = {
-    { container_id = 0, label = "Inventory", description = "active carry: medicines, food, tools, and use-now rewards", categories = { "active" } },
-    { container_id = 4, label = "Locker", description = "keys, testimonies, missives, chips, and pop/access items", categories = { "access" } },
-    { container_id = 7, label = "Case", description = "currencies, seals, pouches, scrolls, abjurations, tatters, and upgrade tokens", categories = { "progression", "scroll" } },
-    { container_id = 5, label = "Satchel", description = "craft materials A: wood, metal, gems, ore, beads, and alchemy base materials", categories = { "craft_a" } },
-    { container_id = 6, label = "Sack", description = "craft materials B: cloth, leather, bone, beast drops, garden, and food ingredients", categories = { "craft_b" } },
-    { container_id = 1, label = "Safe", description = "rare/ex, furnishings, oddities, and long-term overflow", categories = { "rare_misc", "furnishing", "other" } },
-    { container_id = 9, label = "Safe2", description = "additional overflow", categories = {} },
-    { container_id = 2, label = "Storage", description = "additional accessible house storage", categories = {} },
 }
 
 local EPHEMERAL_ITEMS = {
@@ -216,6 +205,7 @@ local function settle_pending_actions()
 end
 
 local function new_run_ready()
+    if automatic.manual_acquisition then return false, "Manual item receipt is being confirmed; wait before starting another run." end
     if automatic.pending then return false, "Background transfer is settling; try again in a moment." end
     if automatic.manual_pending then return false, "Manual bag movement is being confirmed; wait before starting another run." end
     settle_pending_actions()
@@ -266,6 +256,8 @@ settings.register("settings", "oddorg_settings", function(updated)
         and draft.saved_signature ~= nil and draft.saved_signature == automation_settings_signature(preferences)
     cancel_queues("Settings updated; active work stopped. View Plan or start a new deposit to continue. No addon reload needed.")
     if owner_changed then
+        automatic.house_access = nil
+        automatic.manual_acquisition, automatic.moogle_menu = nil, nil
         automatic.holds, automatic.hold_counts, automatic.manual_pending, automatic.freed, automatic.notice_key = {}, {}, nil, 0, nil
         if automatic.owner ~= nil then
             automatic.paused = false
@@ -438,17 +430,21 @@ local function get_keep_reservations(snapshot)
         local _, current_totals = item_rules.reconcile_overrides(overrides, snapshot.items, automatic.hold_counts)
         automatic.hold_counts = current_totals or {}
     end
-    local reserved, reserve_err = item_rules.allocate(snapshot.items, keep, preferences.item_rules, overrides)
+    local effective, effective_err = item_rules.with_default_supplies(snapshot,keep,preferences.item_rules,
+        overrides,preferences.storage_layout,preferences.background and preferences.background.free_slots or 5)
+    if effective_err then return nil,effective_err end
+    local reserved, reserve_err = item_rules.allocate(snapshot.items, keep, effective, overrides)
     if not reserved then return nil, reserve_err end
-    local refill, refill_err = item_rules.refill_reservations(snapshot.items, reserved, preferences.item_rules)
+    local refill, refill_err = item_rules.refill_reservations(snapshot.items, reserved, effective)
     if not refill then return nil, refill_err end
-    return reserved, nil, refill
+    return reserved, nil, refill, effective
 end
 
-local function get_carried_surplus(item_id, carry_floor)
-    local snapshot, _, snapshot_err = collect_live_items()
+local function get_carried_surplus(item_id, carry_floor, snapshot, reserved)
+    local snapshot_err, reserve_err, ignored
+    if not snapshot then snapshot, ignored, snapshot_err = collect_live_items() end
     if not snapshot then return nil, snapshot_err or "inventory unavailable" end
-    local reserved, reserve_err = get_keep_reservations(snapshot)
+    if not reserved then reserved, reserve_err = get_keep_reservations(snapshot) end
     if not reserved then return nil, reserve_err end
     local surplus = 0
     local carried = 0
@@ -567,6 +563,43 @@ end
 -- Mode 2 carries MogExpansionFlag at 0x27; it is independent of wardrobe flags.
 -- Cache this permanent unlock per character so reloading needs no extra trip.
 -- Contract: XiPackets server/0x0067 and LandSandBoat packets/char_sync.cpp.
+function automatic.flush_storage_access()
+    local observation = automatic.safe2_observation
+    if type(observation) ~= "table" then return false end
+    local party = AshitaCore:GetMemoryManager():GetParty()
+    local current_id = party and safe_call(0, function() return party:GetMemberServerId(0) end) or 0
+    local current_index = party and safe_call(0, function() return party:GetMemberTargetIndex(0) end) or 0
+    local character = get_player_slug()
+    local owner = ("%s_%u"):format(settings.name or "", tonumber(settings.server_id) or 0)
+    if not party or safe_call(0, function() return party:GetMemberIsActive(0) end) ~= 1
+        or observation.server_id ~= current_id or observation.index ~= current_index
+        or observation.character ~= character then
+        automatic.safe2_observation = nil
+        return false
+    end
+    if settings.logged_in ~= true or owner ~= character then return false end
+
+    automatic.safe2_observation = nil
+    local previous = preferences.safe2_access
+    if observation.unlocked ~= true then
+        -- The unlock is permanent. A later negative cannot revoke a previously
+        -- confirmed positive, and negatives are not durable cache evidence.
+        write_probe("storage_access", "OBSERVED",
+            type(previous) == "table" and previous.character == character and previous.unlocked == true
+                and "Safe2 negative ignored; permanent unlock already confirmed" or "Safe2 locked",
+            character .. "; session observation")
+        return true
+    end
+    if type(previous) == "table" and previous.character == character and previous.unlocked == true then
+        return true
+    end
+    preferences.safe2_access = { character=character, unlocked=true }
+    local ok, saved = pcall(settings.save)
+    write_probe("storage_access", "OBSERVED", "Safe2 unlocked",
+        character .. ((ok and saved == true) and "; cached" or "; session only: cache save failed"))
+    return true
+end
+
 local function observe_storage_access(e)
     if e.id ~= 0x067 or e.injected ~= false or e.blocked == true then return end
     local data = e.data
@@ -582,18 +615,12 @@ local function observe_storage_access(e)
         or safe_call(0, function() return party:GetMemberIsActive(0) end) ~= 1
         or server_id ~= safe_call(0, function() return party:GetMemberServerId(0) end)
         or index ~= safe_call(0, function() return party:GetMemberTargetIndex(0) end) then return end
-    local character = get_player_slug()
-    if settings.logged_in ~= true
-        or character ~= ("%s_%u"):format(settings.name or "", tonumber(settings.server_id) or 0) then return end
     local flag = data:byte(0x28)
     if flag ~= 0 and flag ~= 1 then return end
-    local previous = preferences.safe2_access
-    local unlocked = flag == 1
-    if type(previous) == "table" and previous.character == character and previous.unlocked == unlocked then return end
-    preferences.safe2_access = { character=character, unlocked=unlocked }
-    local ok, saved = pcall(settings.save)
-    write_probe("storage_access", "OBSERVED", unlocked and "Safe2 unlocked" or "Safe2 locked",
-        character .. ((ok and saved == true) and "; cached" or "; session only: cache save failed"))
+    automatic.safe2_observation = {
+        character=get_player_slug(), server_id=server_id, index=index, unlocked=flag == 1,
+    }
+    automatic.flush_storage_access()
 end
 
 local function container_is_unlocked(inv, container_id, raw_capacity, account_flags, flags_err)
@@ -634,6 +661,7 @@ local function container_is_unlocked(inv, container_id, raw_capacity, account_fl
 end
 
 local function collect_container_access(inv)
+    local started = os.time()
     local account_flags, flags_err = read_account_storage_flags()
     local access_by_container = {}
     local details = {}
@@ -642,7 +670,9 @@ local function collect_container_access(inv)
     local unavailable_count = 0
 
     for _, container_id in ipairs(SCANNED_CONTAINERS) do
+        if os.time() - started >= 2 then return nil, "Storage scan took too long; movement stopped." end
         local raw_capacity = get_container_capacity(inv, container_id)
+        if os.time() - started >= 2 then return nil, "Storage scan took too long; movement stopped." end
         local unlocked, effective_capacity, reason = container_is_unlocked(inv, container_id, raw_capacity, account_flags, flags_err)
         local label = CONTAINERS[container_id] or tostring(container_id)
         access_by_container[container_id] = {
@@ -791,78 +821,6 @@ local function slot_name_from_mask(slots)
     return "other"
 end
 
-local function name_has_any(name, terms)
-    for _, term in ipairs(terms) do
-        if name:find(term, 1, true) ~= nil then
-            return true
-        end
-    end
-    return false
-end
-
-local function non_equipment_category(item_name)
-    local name = string.lower(tostring(item_name or ""))
-    local compact = name:gsub("%.", ""):gsub("'", "")
-
-    if name_has_any(name, {
-        "holy water", "echo drops", "eye drops", "antidote", "remedy", "instant warp",
-        "instant reraise", "silent oil", "prism powder", "special brew", "goblin brew",
-        "gysahl greens", "chronicles", "theory", "miratete", "mint drop", "food", "feast",
-        "sushi", "taco", "risotto", "pie", "parfait", "rusk", "biscuit", "dumpling",
-        "indulgence", "blank", "blnk", "shihei", "sandwich", "hatchet", "pickaxe",
-    }) then
-        return "active"
-    end
-
-    if name_has_any(name, {
-        "testimony", "coffer key", "chest key", "missive", "codex", "chip", "lantern",
-        "odious", "tanscale key", "dangruf stone", "dream coffer", "radiant chip",
-    }) or name:match(" key$") ~= nil or name:find(" key", 1, true) ~= nil then
-        return "access"
-    end
-
-    if name_has_any(name, { " spirit", "scroll", "scroll of" }) then
-        return "scroll"
-    end
-
-    if name_has_any(name, {
-        "seal", "crest", "voucher", "pouch", "purse", "parcel", "case", "tatter",
-        "abjuration", "forgotten", "frgtn", "void", "storage slip", "alexandrite",
-        "bronzepiece", "beitetsu", "pluton", "rift", "commendation", "slime spirit",
-        "beastcoin", "relic iron", " mitts -1", " -1",
-    }) then
-        return "progression"
-    end
-
-    if name_has_any(name, {
-        "lumber", "lbr", " log", "ore", "ingot", "sheet", "nugget", "rivet", "stud",
-        "steel", "bronze", "brass", "copper", "silver", "mythril", "gold", "darksteel",
-        "cobalt", "orichalc", "adaman", "bead", "ametrine", "garnet", "zircon", "topaz",
-        "sapphire", "diamond", "ruby", "emerald", "crystal", "cluster",
-    }) then
-        return "craft_a"
-    end
-
-    if name_has_any(name, {
-        "cloth", "thread", "yarn", "silk", "cotton", "wool", "velvet", "leather",
-        "skin", "hide", "pelt", "fur", "doeskin", "bone", "shell", "scale", "claw",
-        "fang", "jaw", "wing", "feather", "hair", "meat", "root", "herb", "flower",
-        "seed", "acorn", "almond", "fruit", "fish", "ink", "wax", "honey", "blood",
-        "chip", "calculus", "fiber", "acid", "horn", "tusk", "stinger", "talon",
-        "heart", "egg", "sugar", "nut", "garlic", "sap", "twine", "lanolin", "salt",
-        "persikos", "walnut", "foliage", "shadeleaf", "nebimonite", "beard",
-    }) then
-        return "craft_b"
-    end
-
-    if name_has_any(name, { "dream platter", "dream stocking", "red jar", "wood kit", "kit " })
-        or compact:match("^wood kit") ~= nil then
-        return "furnishing"
-    end
-
-    return "rare_misc"
-end
-
 local function is_social_item(item)
     if item == nil then
         return false
@@ -956,6 +914,7 @@ function resource_name_matches(resource, expected_name)
 end
 
 local function validate_move(move, allow_equipped)
+    local validation_started = os.time()
     if move.character_slug ~= get_player_slug() then
         return false, "character mismatch", "expected=" .. move.character_slug .. " actual=" .. get_player_slug()
     end
@@ -1024,8 +983,8 @@ local function validate_move(move, allow_equipped)
     if tonumber(item.Count) < move.quantity then
         return false, "source quantity too small", ("expected=%u actual=%u"):format(move.quantity, tonumber(item.Count) or 0)
     end
-    if move.source_container_id == 0 and bit.band(tonumber(item.Flags) or 0, 1) ~= 0 then
-        return false, "source inventory item is locked", tostring(move.source_index)
+    if bit.band(tonumber(item.Flags) or 0, 1) ~= 0 then
+        return false, "source item is locked", tostring(move.source_index)
     end
 
     local resource = resources:GetItemById(item.Id)
@@ -1065,7 +1024,7 @@ local function validate_move(move, allow_equipped)
         end
     elseif move.source_container_id == INVENTORY_CONTAINER_ID
         and (move.source_index == 0 or move.carried_reserve ~= nil) then
-        local surplus, surplus_err = get_carried_surplus(move.item_id, move.carried_reserve)
+        local surplus, surplus_err = get_carried_surplus(move.item_id, move.carried_reserve, snapshot, reserved)
         if surplus == nil or move.quantity > surplus then
             return false, surplus_err or "move would use your carried reserve", move.item_name
         end
@@ -1083,6 +1042,9 @@ local function validate_move(move, allow_equipped)
         return false, "target container is full", ("%s %u/%u"):format(CONTAINERS[move.target_container_id], used, capacity)
     end
 
+    if os.time() - validation_started >= 2 then
+        return false, "storage validation took too long; movement stopped", move.item_name
+    end
     return true, "validated", ("%s[%u] -> %s"):format(CONTAINERS[move.source_container_id], move.source_index, CONTAINERS[move.target_container_id])
 end
 
@@ -1336,6 +1298,7 @@ local function collect_equipped_keys(quiet)
 end
 
 collect_live_items = function()
+    local scan_started = os.time()
     local inv = AshitaCore:GetMemoryManager():GetInventory()
     local resources = AshitaCore:GetResourceManager()
     local items = {}
@@ -1351,10 +1314,14 @@ collect_live_items = function()
         return nil, nil, "inventory resources unavailable"
     end
 
-    local container_access = collect_container_access(inv)
+    local container_access, access_err = collect_container_access(inv)
+    if not container_access then return nil, nil, access_err end
     local counter, counter_err = read_inventory_counter(inv)
     if counter == nil then return nil, nil, counter_err end
     for _, container_id in ipairs(SCANNED_CONTAINERS) do
+        if os.time() - scan_started >= 2 then
+            return nil, nil, "Storage scan took too long; movement stopped."
+        end
         local access = container_access[container_id] or {
             unlocked = false,
             capacity = 0,
@@ -1369,6 +1336,9 @@ collect_live_items = function()
                 return nil, nil, loaded_err
             end
             for index = 1, access.capacity, 1 do
+                if os.time() - scan_started >= 2 then
+                    return nil, nil, "Storage scan took too long; movement stopped."
+                end
                 local entry = get_container_item(inv, container_id, index)
                 if is_real_item(entry) then
                     local resource = resources:GetItemById(entry.Id)
@@ -1382,6 +1352,7 @@ collect_live_items = function()
                         item_id = tonumber(entry.Id) or 0,
                         quantity = tonumber(entry.Count) or 1,
                         flags = tonumber(entry.Flags) or 0,
+                        locked = bit.band(tonumber(entry.Flags) or 0,1) ~= 0,
                         item_name = name,
                         stack_size = stack_size_for(resource),
                         equippable = is_equipment(resource),
@@ -1402,6 +1373,9 @@ collect_live_items = function()
         end
     end
 
+    if os.time() - scan_started >= 2 then
+        return nil, nil, "Storage scan took too long; movement stopped."
+    end
     if counter == nil or counter ~= safe_call(nil, function() return inv:GetContainerUpdateCounter() end) then
         return nil, nil, "Inventory changed during the scan; wait for it to settle."
     end
@@ -1640,119 +1614,176 @@ local function build_wardrobe_plan(plan, movable_items, capacities)
 end
 
 local function build_storage_plan(plan, movable_items, capacities)
-    local grouped = group_items_by_category(movable_items, function(item)
-        return non_equipment_category(item.item_name)
+    -- Reserve resident slots before any inbound assignment. Otherwise a later
+    -- resident with nowhere to go can overbook an earlier incoming assignment.
+    for _,item in ipairs(movable_items) do
+        if not item.reserved_quantity then
+            plan.target_counts[item.container_id]=(plan.target_counts[item.container_id] or 0)+1
+        end
+    end
+    table.sort(movable_items,function(a,b)
+        if a.item_id~=b.item_id then return a.item_id<b.item_id end
+        if a.container_id~=b.container_id then return a.container_id<b.container_id end
+        return a.index<b.index
     end)
-
-    for _, bucket in ipairs(STORAGE_BUCKETS) do
-        local capacity = capacities[bucket.container_id] or 0
-        for _, category in ipairs(bucket.categories) do
-            while (plan.target_counts[bucket.container_id] or 0) < capacity do
-                local item = pop_best(grouped, category, bucket.container_id)
-                if item == nil then
-                    break
-                end
-                add_assignment(
-                    plan,
-                    item,
-                    bucket.container_id,
-                    bucket,
-                    category,
-                    "non-equipment standard: " .. bucket.description .. "; category=" .. category
-                )
+    local pending=movable_items
+    while #pending>0 do
+        local remaining,progressed={},false
+        for _,item in ipairs(pending) do
+            local target
+            for _,bag in ipairs(storage_layout.default_route(item)) do
+                if (capacities[bag] or 0)>0 and ((bag==item.container_id and (plan.target_counts[bag] or 0)<=capacities[bag])
+                    or (plan.target_counts[bag] or 0)<capacities[bag]) then target=bag; break end
             end
+            if target then
+                if not item.reserved_quantity then plan.target_counts[item.container_id]=plan.target_counts[item.container_id]-1 end
+                add_assignment(plan,item,target,{label=CONTAINERS[target],description='item-type home or overflow'},
+                    storage_layout.classify(item),'non-equipment standard: item-type home or overflow')
+                progressed=true
+            else remaining[#remaining+1]=item end
         end
+        pending=remaining
+        if not progressed then break end
     end
-
-    local leftovers = collect_leftovers(grouped, function(item) return non_equipment_category(item.item_name) end)
-    local overflow_order = { 1, 9, 2, 7, 5, 6, 0, 4 }
-    local buckets_by_container = {}
-    for _, bucket in ipairs(STORAGE_BUCKETS) do
-        buckets_by_container[bucket.container_id] = bucket
-    end
-
-    for _, container_id in ipairs(overflow_order) do
-        local bucket = buckets_by_container[container_id]
-        local capacity = capacities[container_id] or 0
-        while bucket ~= nil and (plan.target_counts[container_id] or 0) < capacity and #leftovers > 0 do
-            local item = pop_overflow(leftovers, container_id)
-            local category = non_equipment_category(item.item_name)
-            add_assignment(
-                plan,
-                item,
-                container_id,
-                bucket,
-                category,
-                "non-equipment overflow standard: " .. bucket.description .. "; category=" .. category
-            )
-        end
-    end
-
-    if #leftovers > 0 then
-        return false, "not enough non-wardrobe capacity for " .. tostring(#leftovers) .. " non-equipment items"
-    end
-    return true, nil
-end
-
--- Default placement can leave identical partial stacks resident in different bags.
--- Co-locate whole, unprotected stacks before building the physical move queue.
-local function consolidate_storage_stacks(plan, snapshot, options, reserved, refill_reserved)
-    if options.scope ~= "all" and options.scope ~= "storage" then return end
-    local groups = {}
-    for _, item in ipairs(snapshot.items) do
-        local key = item_key(item.container_id,item.index)
-        local assignment = plan.assignments[key]
-        local default_assignment = assignment and (assignment.reason == "background-managed item already stored"
-            or assignment.reason:find("non-equipment standard:",1,true) == 1
-            or assignment.reason:find("non-equipment overflow standard:",1,true) == 1)
-        if default_assignment and assignment.target_container_id == item.container_id
-            and item.container_id ~= INVENTORY_CONTAINER_ID and not item.equippable
-            and (item.stack_size or 1) > item.quantity and item.quantity > 0
-            and (reserved[key] or 0) == 0 and (refill_reserved[key] or 0) == 0
-            and bit.band(tonumber(item.flags) or 0,1) == 0
-            and (snapshot.capacities[item.container_id] or 0) > 0 then
-            groups[item.item_id] = groups[item.item_id] or {}
-            table.insert(groups[item.item_id],assignment)
-        end
-    end
-    local ids = {}
-    for id in pairs(groups) do ids[#ids+1] = id end
-    table.sort(ids)
-    for _, id in ipairs(ids) do
-        local candidates = groups[id]
-        table.sort(candidates,function(a,b)
-            local a_room = (plan.target_counts[a.item.container_id] or 0) < (snapshot.capacities[a.item.container_id] or 0)
-            local b_room = (plan.target_counts[b.item.container_id] or 0) < (snapshot.capacities[b.item.container_id] or 0)
-            if a_room ~= b_room then return a_room end
-            if a.item.quantity ~= b.item.quantity then return a.item.quantity > b.item.quantity end
-            if a.item.container_id ~= b.item.container_id then return a.item.container_id < b.item.container_id end
-            return a.item.index < b.item.index
-        end)
-        local consumed = {}
-        for index, anchor in ipairs(candidates) do
-            if not consumed[index] then
-                local target, total = anchor.item.container_id, anchor.item.quantity
-                for next_index = index+1,#candidates do
-                    local source = candidates[next_index]
-                    local item = source.item
-                    if not consumed[next_index] and item.container_id ~= target
-                        and string.lower(item.item_name or "") == string.lower(anchor.item.item_name or "")
-                        and total + item.quantity <= math.min(item.stack_size,anchor.item.stack_size)
-                        and (plan.target_counts[target] or 0) < (snapshot.capacities[target] or 0) then
-                        -- Retain conservative slot accounting: execution may need a
-                        -- temporary slot before confirmed native Auto Sort merges it.
-                        plan.target_counts[item.container_id] = plan.target_counts[item.container_id] - 1
-                        plan.target_counts[target] = (plan.target_counts[target] or 0) + 1
-                        source.target_container_id = target
-                        source.bucket = {label=CONTAINERS[target],description="combine partial stacks"}
-                        source.reason = "consolidate matching partial storage stacks"
-                        consumed[next_index] = true
-                        total = total + item.quantity
+    -- Full bags can exchange residents. Each closed cycle releases exactly one
+    -- slot per destination; the physical scheduler borrows Inventory to execute it.
+    local function find_cycle(items)
+        local edges,visited,path,positions={},{},{},{}
+        for _,item in ipairs(items) do
+            if not item.reserved_quantity then
+                local source=item.container_id
+                edges[source]=edges[source] or {}
+                for _,target in ipairs(storage_layout.default_route(item)) do
+                    if target~=source and (capacities[target] or 0)>0 then
+                        table.insert(edges[source],{item=item,target=target})
                     end
                 end
             end
         end
+        local function visit(bag)
+            visited[bag],positions[bag]=true,#path+1
+            for _,edge in ipairs(edges[bag] or {}) do
+                path[#path+1]=edge
+                if positions[edge.target] then
+                    local cycle={}
+                    for i=positions[edge.target],#path do cycle[#cycle+1]=path[i] end
+                    return cycle
+                elseif not visited[edge.target] then
+                    local cycle=visit(edge.target)
+                    if cycle then return cycle end
+                end
+                path[#path]=nil
+            end
+            positions[bag]=nil
+        end
+        for _,bag in ipairs(SCANNED_CONTAINERS) do
+            if not visited[bag] then local cycle=visit(bag); if cycle then return cycle end end
+        end
     end
+    while #pending>0 do
+        local cycle=find_cycle(pending)
+        if not cycle then break end
+        local assigned={}
+        for _,edge in ipairs(cycle) do
+            local item=edge.item
+            plan.target_counts[item.container_id]=plan.target_counts[item.container_id]-1
+            add_assignment(plan,item,edge.target,{label=CONTAINERS[edge.target],description='full-bag exchange'},
+                storage_layout.classify(item),'default homes: exchange through Inventory')
+            assigned[item]=true
+        end
+        local remaining={}
+        for _,item in ipairs(pending) do if not assigned[item] then remaining[#remaining+1]=item end end
+        pending=remaining
+    end
+    for _,item in ipairs(pending) do
+        local fallback
+        -- Residents already in usable spare storage need no extra transfer.
+        local route=storage_layout.default_route(item,true)
+        if contains(route,item.container_id) then fallback=item.container_id end
+        if not fallback then
+            for _,bag in ipairs(route) do
+                if (plan.target_counts[bag] or 0)<(capacities[bag] or 0) then fallback=bag; break end
+            end
+        end
+        if not item.reserved_quantity then plan.target_counts[item.container_id]=plan.target_counts[item.container_id]-1 end
+        if fallback then
+            add_assignment(plan,item,fallback,{label=CONTAINERS[fallback],description='spare storage'},
+                storage_layout.classify(item),'default homes full: use spare storage')
+        else
+            if #route>0 then plan.default_blocked=(plan.default_blocked or 0)+1 end
+            reserve_pinned(plan,item,'No accessible storage room; leave in place')
+        end
+    end
+    return true
+end
+
+-- Consolidation is a separate first pass. Placement is recomputed from the
+-- confirmed packed inventory, rather than charging one slot for every fragment.
+local function build_stack_plan(snapshot,options,reserved,refill,carried_reserves)
+    if options.scope~='all' and options.scope~='storage' then return nil end
+    local layout_routes=storage_layout.active_routes(preferences.storage_layout)
+    local groups={}
+    local plan={assignments={},target_counts=clone_counts(snapshot.counts),logical_moves={},
+        pinned_social=0,pinned_equipped=0,kept_quantity=0,pending_refill_quantity=0,stacking=true}
+    for _,item in ipairs(snapshot.items) do
+        local key=item_key(item.container_id,item.index)
+        local protected=(reserved[key] or 0)+(refill[key] or 0)
+        plan.kept_quantity=plan.kept_quantity+(reserved[key] or 0)
+        plan.pending_refill_quantity=plan.pending_refill_quantity+(refill[key] or 0)
+        local outcome=item_outcome(item)
+        if (item.stack_size or 1)>1 and not item.equippable and not is_social_item(item)
+            and (tonumber(item.flags) or 0)==0 and storage_layout.classify(item)
+            and outcome and outcome.mode~='stay'
+            and not ((layout_routes or outcome.destination~=nil) and not outcome.allowed) then
+            local entry={item=item,quantity=item.quantity,available=math.max(0,item.quantity-protected)}
+            groups[item.item_id]=groups[item.item_id] or {}
+            table.insert(groups[item.item_id],entry)
+        end
+    end
+    local ids={}
+    for id in pairs(groups) do ids[#ids+1]=id end
+    table.sort(ids)
+    local inventory_free=(snapshot.capacities[0] or 0)-(snapshot.counts[0] or 0)
+    for _,id in ipairs(ids) do
+        local group=groups[id]
+        table.sort(group,function(a,b)
+            if (a.item.container_id==0)~=(b.item.container_id==0) then return b.item.container_id==0 end
+            local a_split=a.available>0 and a.available<a.quantity
+            local b_split=b.available>0 and b.available<b.quantity
+            if a_split~=b_split then return b_split end
+            if a.quantity~=b.quantity then return a.quantity>b.quantity end
+            if a.item.container_id~=b.item.container_id then return a.item.container_id<b.item.container_id end
+            return a.item.index<b.item.index
+        end)
+        for index,anchor in ipairs(group) do
+            if anchor.item.container_id~=0 and anchor.quantity>0 then
+                local room=anchor.item.stack_size-anchor.quantity
+                for donor_index=index+1,#group do
+                    local donor=group[donor_index]
+                    local quantity=math.min(room,donor.available)
+                    local target=anchor.item.container_id
+                    local empty=(snapshot.capacities[target] or 0)-(snapshot.counts[target] or 0)
+                    local can_stage=donor.item.container_id==0 or inventory_free>0
+                    local can_merge=donor.item.container_id~=0 or quantity==donor.quantity or empty>0
+                    if quantity>0 and can_stage and can_merge and donor.item.item_name==anchor.item.item_name then
+                        plan.logical_moves[#plan.logical_moves+1]={
+                            move_id=options.character_slug..'-stack-'..tostring(#plan.logical_moves+1),
+                            character_slug=options.character_slug,item_id=id,item_name=donor.item.item_name,
+                            quantity=quantity,stack_size=donor.item.stack_size,
+                            source_container_id=donor.item.container_id,source_index=donor.item.index,
+                            target_container_id=target,carried_reserve=carried_reserves[id] or 0,
+                            stack_consolidation=true,bucket=CONTAINERS[target],reason='fill existing partial stack',scope='storage'}
+                        donor.quantity=donor.quantity-quantity
+                        donor.available=donor.available-quantity
+                        anchor.quantity=anchor.quantity+quantity
+                        room=room-quantity
+                    end
+                    if room==0 then break end
+                end
+            end
+        end
+    end
+    return #plan.logical_moves>0 and plan or nil
 end
 
 local function build_organize_plan(snapshot, options)
@@ -1773,9 +1804,9 @@ local function build_organize_plan(snapshot, options)
         local item_id = tonumber(id)
         carried_reserves[item_id] = math.max(carried_reserves[item_id] or 0, item_rules.carry_target(rule))
     end
+    local stack_plan=build_stack_plan(snapshot,options,reserved,refill_reserved,carried_reserves)
+    if stack_plan then return stack_plan end
     local equipped_keys = options.allow_equipped and {} or collect_equipped_keys()
-    local background = type(preferences) == "table" and preferences.background
-    local preserve_stored = background and (background.enabled == true or preferences.sort_enabled == true) and housekeeping.validate(background)
     local plan = {
         assignments = {},
         target_counts = {},
@@ -1810,7 +1841,7 @@ local function build_organize_plan(snapshot, options)
             reserve_pinned(plan, item, "your item protection")
         elseif options.scope ~= "all" and options.scope ~= move_scope then
             reserve_pinned(plan, item, "outside requested scope")
-        elseif (layout_routes or outcome.destination ~= nil or item.container_id == 0) and bit.band(tonumber(item.flags) or 0, 1) ~= 0 then
+        elseif bit.band(tonumber(item.flags) or 0, 1) ~= 0 then
             reserve_pinned(plan, item, "item currently locked or in use")
         elseif equipped_keys[key] then
             plan.pinned_equipped = plan.pinned_equipped + 1
@@ -1824,11 +1855,6 @@ local function build_organize_plan(snapshot, options)
             reserve_pinned(plan, item, "your per-item rule keeps extras where they are")
         elseif (layout_routes or outcome.destination ~= nil) and not outcome.allowed then
             reserve_pinned(plan, item, "not assigned or individually excluded from this quickset")
-        elseif not layout_routes and preserve_stored and item.container_id ~= INVENTORY_CONTAINER_ID
-            and outcome.allowed and outcome.mode ~= "specific" and outcome.destination == nil then
-            -- Clearing and organization share ownership: once a default-managed item
-            -- is stored, sorting must not retrieve it and trigger another eviction.
-            reserve_pinned(plan, item, "background-managed item already stored")
         elseif outcome.mode == "specific" or outcome.destination ~= nil then
             local candidate = item
             if protected > 0 then
@@ -1877,7 +1903,6 @@ local function build_organize_plan(snapshot, options)
         return nil, err
     end
 
-    consolidate_storage_stacks(plan,snapshot,options,reserved,refill_reserved)
 
     for _, item in ipairs(snapshot.items) do
         local assignment = plan.assignments[item_key(item.container_id, item.index)]
@@ -1931,6 +1956,7 @@ local function snapshot_maps(snapshot)
             item_name = item.item_name,
             stack_size = item.stack_size,
             equippable = item.equippable,
+            locked = (tonumber(item.flags) or 0) ~= 0,
         }
         if item.container_id == INVENTORY_CONTAINER_ID then
             inventory_slots[item.index] = true
@@ -1964,6 +1990,7 @@ local function find_stack_target(move, items_by_slot, blocked_source_keys)
     for key, item in pairs(items_by_slot) do
         if key ~= source_key
             and not blocked_source_keys[key]
+            and not item.locked
             and item.container_id == move.target_container_id
             and item.item_id == move.item_id
             and string.lower(item.item_name or "") == string.lower(move.item_name or "")
@@ -1975,13 +2002,15 @@ local function find_stack_target(move, items_by_slot, blocked_source_keys)
 end
 
 local function target_accepts(move, counts, capacities, items_by_slot, blocked_source_keys)
-    -- STACKING_IS_LIVE_VALIDATION_ONLY: planner treats stack deposits as slot-consuming.
-    -- The live validator may still allow a full-target stack, but queue simulation stays conservative.
-    local capacity = capacities[move.target_container_id] or 0
-    if capacity <= 0 then
-        return false, nil
+    local capacity=capacities[move.target_container_id] or 0
+    if capacity<=0 then return false,nil end
+    local source=items_by_slot[item_key(move.source_container_id,move.source_index)]
+    -- A stored split is staged as its own Inventory stack before the put.
+    if source and (move.source_container_id~=0 or source.quantity==move.quantity) then
+        local stack_key=find_stack_target(move,items_by_slot,blocked_source_keys)
+        if stack_key then return true,stack_key end
     end
-    return (counts[move.target_container_id] or 0) < capacity, nil
+    return (counts[move.target_container_id] or 0)<capacity,nil
 end
 
 local function remove_state_item(item, counts, inventory_slots, items_by_slot)
@@ -2101,7 +2130,7 @@ local function build_physical_queue(logical_moves, snapshot)
     local physical = {}
 
     for _, move in ipairs(logical_moves) do
-        if move.source_container_id ~= move.target_container_id then
+        if move.source_container_id ~= move.target_container_id or move.stack_consolidation then
             table.insert(pending, copy_move(move))
         end
     end
@@ -2301,7 +2330,42 @@ local function parse_organize_options(args)
     return options
 end
 
-local function build_preview_or_queue(options)
+-- Stop only when every temporary Inventory pull in this prefix has its put.
+-- Full-bag exchanges can interleave several pairs, so adjacent pairs alone
+-- are not a sufficient boundary.
+local function limit_organization_batch(plan, queue, budget)
+    budget = math.max(0, math.min(50, budget or 50))
+    if #queue <= budget then return queue end
+    local puts, staged, safe, open = {}, {}, 0, 0
+    for _, move in ipairs(queue) do
+        if move.suffix == 'put' then puts[move.move_id:gsub('%-put$','')] = true end
+    end
+    for index=1,math.min(budget,#queue) do
+        local move=queue[index]
+        local id=move.move_id:gsub('%-pull$',''):gsub('%-put$','')
+        if move.suffix=='pull' and puts[id] then
+            staged[id]=true; open=open+1
+        elseif move.suffix=='put' and staged[id] then
+            staged[id]=nil; open=open-1
+        end
+        if open==0 then safe=index end
+    end
+    if safe==0 then return nil,'No complete transfer group fits the remaining 50-move budget.' end
+    local batch, included={},{}
+    for index=1,safe do
+        local move=queue[index]
+        batch[index]=move
+        included[move.move_id:gsub('%-pull$',''):gsub('%-put$','')]=true
+    end
+    local logical={}
+    for _,move in ipairs(plan.logical_moves) do
+        if included[move.move_id] then logical[#logical+1]=move end
+    end
+    plan.logical_moves,plan.batch_limited=logical,true
+    return batch
+end
+
+local function build_preview_or_queue(options, budget)
     local snapshot, _, err = collect_live_items()
     if snapshot == nil then
         return nil, nil, err
@@ -2319,6 +2383,8 @@ local function build_preview_or_queue(options)
         return nil, nil, queue_err
     end
 
+    queue, queue_err = limit_organization_batch(plan,queue,budget)
+    if not queue then return nil,nil,queue_err end
     write_plan(plan, queue)
     write_probe(
         "plan_done",
@@ -2363,6 +2429,7 @@ local function start_organize_queue(options, plan, queue)
     organizer.options = storage_layout.clone(options)
     organizer.pass = 1
     organizer.completed_transfers = 0
+    organizer.batch_limited = plan.batch_limited
     organizer.seen_states = {[organization_state_signature(plan.snapshot)] = true}
     ui.visible = true
     ui.page, ui.settings_tab = "settings", "bulk"
@@ -3647,7 +3714,16 @@ local function run_organizer_tick()
             say("requested move complete.")
             return
         end
-        local plan, queue, err = build_preview_or_queue(organizer.options)
+        local completed = organizer.completed_transfers + #organizer.queue
+        if organizer.batch_limited or completed >= 50 then
+            organizer.running = false
+            organizer.completed_transfers = completed
+            ui.bulk_preview_ready, ui.bulk_preview_displayed = nil, nil
+            ui.bulk_result = ("Batch finished: %u transfers. View Plan to check remaining work."):format(completed)
+            say(ui.bulk_result)
+            return
+        end
+        local plan, queue, err = build_preview_or_queue(organizer.options, 50-completed)
         if not plan then
             organizer.running = false
             organizer.error = "Final organization check failed: " .. tostring(err)
@@ -3660,6 +3736,12 @@ local function run_organizer_tick()
         if #queue == 0 then
             organizer.running = false
             organizer.awaiting_inventory = nil
+            if (plan.default_blocked or 0) > 0 then
+                ui.bulk_result=("Organization stopped: %u stacks have full or unavailable default homes; left in place."):format(plan.default_blocked)
+                write_probe("queue_done","BLOCKED",ui.bulk_result,"default storage capacity")
+                say(ui.bulk_result)
+                return
+            end
             write_probe("queue_done", "OK", "fresh plan confirms no remaining moves",
                 ("sent=%u passes=%u"):format(organizer.completed_transfers,organizer.pass))
             ui.bulk_result = ("Organization complete: %u transfers; no remaining moves."):format(organizer.completed_transfers)
@@ -3679,6 +3761,7 @@ local function run_organizer_tick()
         organizer.seen_states[signature] = true
         organizer.pass = organizer.pass + 1
         organizer.queue, organizer.cursor = queue, 1
+        organizer.batch_limited = plan.batch_limited
         organizer.stack_bags, organizer.awaiting_inventory = nil, nil
         organizer.summary = {logical=#plan.logical_moves,physical=#queue}
         organizer.next_send_at = os.clock() + organizer.delay
@@ -3744,7 +3827,7 @@ function automatic.snapshot()
     if not inv or not resources then return nil end
     local rules_valid, rules_err = item_rules.validate(preferences.item_rules)
     if not rules_valid then return nil, rules_err end
-    local snapshot = { items={}, capacities={}, counts={} }
+    local snapshot = { items={}, capacities={}, counts={}, stack_access={[2]=automatic.storage_stack_access()} }
     local counter, counter_err = read_inventory_counter(inv)
     if counter == nil then return nil, counter_err end
     local equipped = collect_equipped_keys(true)
@@ -3767,7 +3850,7 @@ function automatic.snapshot()
         end
     end
     local scan_all = preferences.sort_enabled or storage_layout.active_routes(preferences.storage_layout)
-        or refill_configured
+        or refill_configured or (preferences.background and preferences.background.enabled)
     local scan_bags = scan_all and SCANNED_CONTAINERS or { 0, 5, 6, 7 }
     if not scan_all then
         local included = { [0]=true, [5]=true, [6]=true, [7]=true }
@@ -3896,24 +3979,20 @@ function automatic.destinations(item)
         local bag = outcome.destination
         return bag and bag ~= 2 and { bag } or {}
     end
-    if preferences.sort_enabled ~= true then return { 5, 6, 7 } end
-    local result, seen = {}, {}
-    local function add(bag)
-        -- CatsEye Storage is restricted to the appropriate Mog House. Unattended
-        -- work uses the other bags and never relies on a house arrival.
-        if bag ~= 0 and bag ~= 2 and not seen[bag] then
-            seen[bag] = true; result[#result+1] = bag
-        end
-    end
-    local buckets = item.equippable and WARDROBE_BUCKETS or STORAGE_BUCKETS
-    local category = item.equippable and item.slot_category or non_equipment_category(item.item_name)
-    for _, bucket in ipairs(buckets) do
-        for _, match in ipairs(bucket.categories) do if match == category then add(bucket.container_id) end end
-    end
+    local result = {}
     if item.equippable then
-        for _, bucket in ipairs(buckets) do add(bucket.container_id) end
+        local seen = {}
+        local function add(bag) if not seen[bag] then seen[bag]=true; result[#result+1]=bag end end
+        for _,bucket in ipairs(WARDROBE_BUCKETS) do
+            for _,category in ipairs(bucket.categories) do
+                if category == item.slot_category then add(bucket.container_id) end
+            end
+        end
+        for _,bucket in ipairs(WARDROBE_BUCKETS) do add(bucket.container_id) end
     else
-        for _, bag in ipairs({ 1, 9, 7, 5, 6, 4 }) do add(bag) end
+        for _,bag in ipairs(storage_layout.default_route(item,true)) do
+            if bag ~= 2 or automatic.storage_stack_access() then result[#result+1]=bag end
+        end
     end
     return result
 end
@@ -4117,6 +4196,9 @@ local function inspect_manual_moves(pending)
 end
 
 function automatic.tick()
+    automatic.flush_storage_access()
+    automatic.confirm_manual_acquisition()
+    if automatic.manual_acquisition then return end
     if automatic.manual_pending then
         local state, result = inspect_manual_moves(automatic.manual_pending)
         if state == "pending" then return end
@@ -4149,7 +4231,7 @@ function automatic.tick()
         if state == "failed" then automatic.pause(message); return end
         local completed = automatic.pending.move
         automatic.pending = nil
-        if completed.purpose ~= "refill" then automatic.freed = automatic.freed + 1 end
+        if completed.frees_slot then automatic.freed = automatic.freed + 1 end
         automatic.next_check = os.time() + 2
     end
     if os.time() < automatic.next_check then return end
@@ -4188,6 +4270,17 @@ function automatic.tick()
         for _, item in ipairs(snapshot.items) do
             local source_key = item_key(item.container_id, item.index)
             local quantity = tonumber(refill_reserved[source_key]) or 0
+            local explicit = preferences.item_rules and preferences.item_rules.items[tostring(item.item_id)]
+            if quantity > 0 and not explicit then
+                local free=(snapshot.capacities[0] or 0)-(snapshot.counts[0] or 0)
+                local room=0
+                for _,carried in ipairs(snapshot.items) do
+                    if carried.container_id == 0 and carried.item_id == item.item_id and not carried.locked then
+                        room=room+math.max(0,carried.stack_size-carried.quantity)
+                    end
+                end
+                if free <= config.free_slots and room < quantity then quantity=0 end
+            end
             if quantity > 0 then
                 local move = {
                     move_id="refill-" .. character .. "-" .. item.container_id .. "-" .. item.index,
@@ -4249,14 +4342,170 @@ function automatic.tick()
     local observation, observation_err = capture_move_observation(move)
     if not observation then automatic.pause(observation_err); return end
     automatic.pending = observation
-    automatic.status = "Making space: " .. move.item_name .. " -> " .. CONTAINERS[move.target_container_id]
+    automatic.status = (move.purpose=="stack" and "Stacking: " or "Making space: ") .. move.item_name .. " -> " .. CONTAINERS[move.target_container_id]
     send_move_packet(move)
-    write_audit(move.move_id, "SENT", "background free-space clearing", move_to_command_label(move))
+    write_audit(move.move_id, "SENT", move.purpose=="stack" and "fill existing stack" or "background free-space clearing", move_to_command_label(move))
+end
+
+-- Native menu/item-use contracts: Windower packets/fields.lua (0x034, 0x05B,
+-- 0x037), LSB ephemeral_moogle.lua and elemental cluster item scripts.
+-- Observe intent and then inventory results; never send menu or use-item packets.
+local function packet_number(data, offset, size)
+    if type(data) ~= 'string' or #data < offset + size then return nil end
+    local value = 0
+    for index = offset + size, offset + 1, -1 do value = value * 256 + data:byte(index) end
+    return value
+end
+
+function automatic.storage_stack_access()
+    local proof=automatic.house_access
+    local party=AshitaCore:GetMemoryManager():GetParty()
+    return proof~=nil and proof.character==get_player_slug()
+        and proof.zone==safe_call(nil,function() return party:GetMemberZone(0) end)
+end
+
+-- Native 0x00A LoginState at raw 0x80 (LSB s2c/0x00a_login.h).
+-- Feretory uses MYROOM for its menu but is not a residence.
+function automatic.observe_house_access(e)
+    if e.injected~=false or e.blocked==true or (e.id~=0x00A and e.id~=0x00B) then return end
+    automatic.house_access=nil
+    local data=e.data
+    if e.id~=0x00A or packet_number(data,0x80,4)~=1 then return end
+    local party=AshitaCore:GetMemoryManager():GetParty()
+    local zone=packet_number(data,0x30,2)
+    if not zone or zone==285 or packet_number(data,4,4)~=safe_call(nil,function() return party:GetMemberServerId(0) end) then return end
+    automatic.house_access={character=get_player_slug(),zone=zone}
+end
+
+function automatic.observe_moogle_menu(e)
+    if (e.id ~= 0x032 and e.id ~= 0x034) or e.injected ~= false or e.blocked == true then return end
+    automatic.moogle_menu = nil
+    local data = e.data_modified or e.data
+    local offset = e.id == 0x034 and 0x28 or 0x08
+    local index, zone, menu = packet_number(data,offset,2), packet_number(data,offset+2,2), packet_number(data,offset+4,2)
+    local server = packet_number(data,4,4)
+    if not index or not zone or not menu or not current_keep_rules() then return end
+    local target = get_target_by_index(index)
+    if not target or target.server_id ~= server or target.zone ~= zone
+        or string.lower(target.name or '') ~= 'ephemeral moogle'
+        or not target.distance or target.distance > 6 then return end
+    automatic.moogle_menu = {target=target, menu=menu, character=get_player_slug()}
+end
+
+function automatic.confirm_manual_acquisition()
+    local pending = automatic.manual_acquisition
+    if not pending then return end
+    local party = AshitaCore:GetMemoryManager():GetParty()
+    if pending.character ~= get_player_slug()
+        or pending.zone ~= safe_call(nil, function() return party:GetMemberZone(0) end) then
+        automatic.manual_acquisition = nil
+        return
+    end
+    local snapshot = collect_live_items()
+    local totals = snapshot and item_rules.location_totals(snapshot.items)
+    local gains, complete, changed = {}, true, false
+    if totals then
+        for id, expected in pairs(pending.expected) do
+            local delta = (totals[id..':0'] or 0) - pending.before[id]
+            if delta < 0 or delta > expected then pending.ambiguous = true end
+            gains[id] = math.max(0,delta)
+            if delta ~= expected then complete = false end
+            if delta > 0 then changed = true end
+        end
+        if pending.cluster then
+            local consumed = pending.cluster_before - (totals[tostring(pending.cluster)..':0'] or 0)
+            if consumed < 0 or consumed > 1 then pending.ambiguous = true end
+            complete = complete and consumed == 1
+            -- A cluster's output must be exact; partial packet updates must settle.
+        elseif changed then
+            local signature = tostring(gains[pending.crystal_id])..':'..tostring(gains[pending.cluster_id])
+            if signature ~= pending.signature then pending.signature, pending.changed_at = signature, os.clock() end
+            -- "As many as fit" can legitimately yield less than the requested maximum.
+            complete = complete or (pending.allow_partial and os.clock() - pending.changed_at >= 1)
+        end
+    else complete = false end
+    if pending.ambiguous or (not complete and os.clock() >= pending.deadline) then
+        automatic.manual_acquisition = nil
+        automatic.pause('Manual item receipt could not be confirmed exactly.')
+        return
+    end
+    if not complete or not changed then return end
+    -- Reconcile consumption once before adding the newly protected quantities.
+    item_rules.reconcile_overrides(automatic.holds,snapshot.items,automatic.hold_counts)
+    for id, quantity in pairs(gains) do
+        if quantity > 0 then item_rules.record_manual_gain(automatic.holds,tonumber(id),0,quantity) end
+    end
+    automatic.owner, automatic.hold_counts = pending.character, totals
+    automatic.manual_acquisition = nil
+    automatic.next_check = os.time() + 2
+    automatic.status = pending.cluster and 'Crystals from your manually held cluster stay in Inventory.'
+        or 'Your Moogle withdrawal stays in Inventory for this session.'
+    write_probe('manual_acquisition','CONFIRMED',automatic.status,pending.kind)
+end
+
+function automatic.observe_manual_acquisition(e)
+    if e.injected ~= false or e.blocked == true or (e.id ~= 0x05B and e.id ~= 0x037) then return end
+    automatic.confirm_manual_acquisition()
+    if not current_keep_rules() then return end
+    local data = e.data_modified or e.data
+    local party = AshitaCore:GetMemoryManager():GetParty()
+    local zone = safe_call(nil,function() return party:GetMemberZone(0) end)
+    local pending = {character=get_player_slug(),zone=zone,expected={},before={},deadline=os.clock()+15}
+    if e.id == 0x05B then
+        local context = automatic.moogle_menu
+        local server, index = packet_number(data,4,4), packet_number(data,12,2)
+        local amount, element = packet_number(data,8,2), packet_number(data,10,1)
+        if not context or context.character ~= pending.character or context.target.zone ~= zone
+            or context.target.server_id ~= server or context.target.index ~= index
+            or packet_number(data,18,2) ~= context.menu or packet_number(data,16,2) ~= zone
+            or packet_number(data,14,1) ~= 0 then return end
+        automatic.moogle_menu = nil
+        local target = get_target_by_index(index)
+        if not target or target.server_id ~= server or string.lower(target.name or '') ~= 'ephemeral moogle'
+            or not target.distance or target.distance > 6 then return end
+        if not amount or amount < 1 or amount > 5000 or not element or element < 1 or element > 8 then return end
+        pending.kind = 'moogle withdrawal'
+        pending.crystal_id, pending.cluster_id = tostring(4095+element), tostring(4103+element)
+        pending.expected[pending.crystal_id] = amount % 12
+        pending.expected[pending.cluster_id] = math.floor(amount/12)
+        pending.allow_partial = bit.band(packet_number(data,11,1) or 0,0x80) ~= 0
+        moogle.pass = {target=target,scene=pending.character..':'..tostring(zone),claimed=true}
+    else
+        local slot, bag = packet_number(data,14,1), packet_number(data,16,1)
+        if bag ~= 0 or not slot or slot < 1 or slot > 80
+            or packet_number(data,4,4) ~= safe_call(nil,function() return party:GetMemberServerId(0) end)
+            or packet_number(data,12,2) ~= safe_call(nil,function() return party:GetMemberTargetIndex(0) end) then return end
+        local item = get_container_item(AshitaCore:GetMemoryManager():GetInventory(),0,slot)
+        local id = is_real_item(item) and tonumber(item.Id)
+        if not id or id < 4104 or id > 4111 then return end
+        local held = automatic.owner == pending.character and automatic.holds[tostring(id)]
+        if held ~= true and (type(held) ~= 'table' or (tonumber(held['0']) or 0) < 1) then return end
+        pending.kind, pending.cluster = 'held cluster use', id
+        pending.cluster_before = container_item_count(0,id)
+        pending.expected[tostring(id-8)] = 12
+        if not pending.cluster_before then return end
+    end
+    if automatic.manual_acquisition or automatic.manual_pending or automatic.pending
+        or organizer.awaiting_move or ephemeral.awaiting_trade or ephemeral.awaiting_inventory then
+        if automatic.manual_acquisition then automatic.manual_acquisition.ambiguous = true end
+        automatic.pause('Overlapping manual item actions need an Inventory check.')
+        return
+    end
+    for id in pairs(pending.expected) do
+        local count = container_item_count(0,tonumber(id))
+        if count == nil then return end
+        pending.before[id] = count
+    end
+    automatic.manual_acquisition = pending
+    automatic.owner = pending.character
+    cancel_queues('Manual item action detected; waiting for its result.')
+    automatic.next_check = os.time() + 2
 end
 
 -- Passive observation only. Ashita's packet_out.injected flag distinguishes
 -- native manual bag moves from addon-generated staging moves.
 function automatic.observe_retrieval(e)
+    automatic.observe_manual_acquisition(e)
     if e.id ~= MOVE_PACKET_ID or e.injected ~= false or e.blocked == true then return end
     local data = e.data_modified or e.data
     if type(data) ~= "string" or #data < 12 then return end
@@ -4272,6 +4521,12 @@ function automatic.observe_retrieval(e)
     local resource = resources and resources:GetItemById(entry.Id)
     local item_name = first_resource_name(resource)
     if item_name == "" then return end
+    local acquisition = automatic.manual_acquisition
+    if acquisition and (source == 0 or destination == 0)
+        and (acquisition.expected[tostring(entry.Id)] ~= nil or acquisition.cluster == tonumber(entry.Id)) then
+        -- The receipt delta can no longer distinguish these two manual actions.
+        acquisition.ambiguous = true
+    end
     local already_tracking = automatic.manual_pending ~= nil
     if not add_manual_move_intent(tonumber(entry.Id), item_name, source, destination, index, quantity) then
         return
@@ -4634,18 +4889,23 @@ local function item_rule_equal(left, right)
         and left.deposit == right.deposit
 end
 
-local function new_item_draft(selected, keep)
+local function new_item_draft(selected, keep, snapshot)
     local rule, err = item_rules.for_item(preferences.item_rules,selected.id)
     if err then return nil, err end
     local quantity = type(keep[tostring(selected.id)]) == "number" and keep[tostring(selected.id)]
         or EPHEMERAL_ITEMS[selected.id] and 24 or 1
+    local default_target = 0
+    if not rule and snapshot then
+        local _,_,_,effective = get_keep_reservations(snapshot)
+        default_target=item_rules.carry_target(effective and effective.items[tostring(selected.id)])
+    end
     return {
         item_id=selected.id, character=get_player_slug(),
         mode=keep[tostring(selected.id)] == "all" and "all"
             or type(keep[tostring(selected.id)]) == "number" and keep[tostring(selected.id)] > 0 and "number" or "none",
         quantity={quantity}, allowed={legacy_item_allowed(selected.id)},
         item_rule_present=rule ~= nil, item_rule_dirty=false, clear_item_rule=false,
-        carry_target={rule and rule.carry_target or 0},
+        carry_target={rule and rule.carry_target or default_target}, default_carry_target=default_target,
         destination=rule and rule.destination or "default",
         deposit={rule and rule.deposit or false},
     }
@@ -4702,8 +4962,10 @@ local function item_settings_preview(selected, snapshot, draft)
         local _, current_totals=item_rules.reconcile_overrides(holds,snapshot.items,automatic.hold_counts)
         automatic.hold_counts=current_totals or {}
     end
-    local reserved = assert(item_rules.allocate(snapshot.items,keep,data,holds))
-    local refill = assert(item_rules.refill_reservations(snapshot.items,reserved,data))
+    local effective = item_rules.with_default_supplies(snapshot,keep,data,holds,preferences.storage_layout,
+        preferences.background and preferences.background.free_slots or 5)
+    local reserved = assert(item_rules.allocate(snapshot.items,keep,effective,holds))
+    local refill = assert(item_rules.refill_reservations(snapshot.items,reserved,effective))
     local routes = storage_layout.active_routes(preferences.storage_layout)
     local probe = {item_id=selected.id,item_name=selected.name,
         equippable=is_equipment(AshitaCore:GetResourceManager():GetItemById(selected.id))}
@@ -4719,7 +4981,7 @@ local function item_settings_preview(selected, snapshot, draft)
     local allowed = item_rules.allows_storage(rule,default_allowed)
     local result = { ignored=0, inventory=0, stored=0, store_quantity=0, store_slots=0,
         deposit_quantity=0, held=temporary_hold_label(selected.id) ~= nil,
-        carried=selected.carried, carry_target=item_rules.carry_target(rule),
+        carried=selected.carried, carry_target=item_rules.carry_target(effective and effective.items[tostring(selected.id)]),
         refill_quantity=0, destination=destination, destination_mode=mode,
         destination_name=mode=="specific" and CONTAINERS[destination] or mode=="stay" and "Leave where it is"
             or destination and CONTAINERS[destination] or "Default placement" }
@@ -4779,7 +5041,7 @@ local function item_draft_changes(selected, draft, rule)
     local saved = (preferences.item_rules and preferences.item_rules.items[tostring(selected.id)]) or nil
     -- Returning an inherited rule to its initial controls must not materialize
     -- an explicit rule (which could change inherited deposit permission).
-    if not saved and not draft.clear_item_rule and draft.carry_target[1] == 0
+    if not saved and not draft.clear_item_rule and draft.carry_target[1] == (draft.default_carry_target or 0)
         and draft.destination == "default" and not draft.deposit[1] then
         draft.item_rule_dirty = false
     end
@@ -4898,7 +5160,7 @@ local function render_protections(embedded)
                         draft = ui.item_draft_cache[tostring(selected.id)]
                     end
                     if not draft or draft.character ~= get_player_slug() then
-                        draft = new_item_draft(selected,keep)
+                        draft = new_item_draft(selected,keep,snapshot)
                         ui.item_draft = draft
                     end
                     if skin.icon(imgui,nil,40*ui_scale(),selected.id) then same_line() end
@@ -4915,8 +5177,11 @@ local function render_protections(embedded)
                     ui_tooltip("Current quantities in each bag. These rules also apply to future copies. Apply saves this item's rules.")
                     skin.locations(imgui,selected.locations,CONTAINERS,ui_scale())
                     if selected.total == 0 then ui_wrapped_text("None in your bags. This rule also applies to future copies.", UI_COLORS.muted) end
+                    if not draft.item_rule_dirty and (not draft.item_rule_present or draft.clear_item_rule) then
+                        draft.carry_target[1],draft.default_carry_target=result.carry_target,result.carry_target
+                    end
                     ui_text("KEEP IN INVENTORY", UI_COLORS.gold)
-                    ui_tooltip("Set a target in individual items, not stacks. Automatic care refills from accessible bags; 0 means no refill target.")
+                    ui_tooltip("OddOrg Default keeps one stack of recognized combat supplies when the empty-slot budget allows. A saved item target overrides that budget; 0 disables refill for this item. Free Inventory slots must be enabled to restock.")
                     if imgui.PushItemWidth then imgui.PushItemWidth(150*ui_scale()) end
                     if imgui.InputInt("##item_carry_target",draft.carry_target) then
                         draft.carry_target[1]=math.max(0,math.min(99999,draft.carry_target[1]))
@@ -4956,7 +5221,7 @@ local function render_protections(embedded)
                         end
                     end
                     ui_text("TARGET STORAGE PLACEMENT",UI_COLORS.gold)
-                    ui_tooltip("Choose where extra copies belong. Specific bags override your storage layout. Automatic moves also require a character automation switch.")
+                    ui_tooltip("Choose the home for new stacks. Automatic care fills compatible existing stacks first, even in another bag. Bulk Run applies this destination after consolidation. Automatic moves require a character automation switch.")
                     local prior_destination=draft.destination
                     draft.destination=layout_choice("##item_destination",draft.destination,destination_choices,
                         math.max(1,imgui.GetContentRegionAvail()-1))
@@ -5141,10 +5406,15 @@ end
 local function render_preview()
     if not ui.preview_visible or not ui.preview_plan then return end
     local plan = ui.preview_plan
-    ui_text(("%u item moves; %u items kept in place."):format(#plan.logical_moves, plan.kept_quantity),UI_COLORS.text)
+    ui_text((plan.stacking and "Stack consolidation: " or "")
+        ..("%u item moves; %u items kept in place."):format(#plan.logical_moves, plan.kept_quantity),UI_COLORS.text)
+    if plan.batch_limited then ui_tooltip("This batch stops at a safe boundary within 50 transfers. Use View Plan afterward to continue remaining work.") end
+    if plan.stacking then ui_tooltip("Bulk Run combines partial stacks first, then moves completed stacks to their configured homes.") end
     if imgui.BeginChild("oddorg_preview_moves", { 0, 0 }, true) then
         skin.panel(imgui,'slot',0.3)
-        if #plan.logical_moves == 0 then imgui.TextWrapped("Nothing needs moving in this scope.") end
+        if (plan.default_blocked or 0) > 0 then
+            imgui.TextWrapped(("%u stacks left in place: default homes are full or unavailable."):format(plan.default_blocked))
+        elseif #plan.logical_moves == 0 then imgui.TextWrapped("Nothing needs moving in this scope.") end
         for _, move in ipairs(plan.logical_moves) do
             if skin.icon(imgui,nil,24*ui_scale(),move.item_id) then same_line() end
             imgui.TextWrapped(("%s x%u: %s -> %s"):format(move.item_name, move.quantity,
@@ -5379,6 +5649,12 @@ local function render_layout_editor(busy)
     if GEAR_ONLY_CONTAINERS[draft.bag] and not category.gear then draft.bag=6 end
     ui_text("Store in",UI_COLORS.text)
     draft.bag=layout_choice("##layout_bag",draft.bag,destinations,width-1)
+    if base and draft.bag == 0 then
+        local route=storage_layout.default_route_for_category(draft.category)
+        ui_tooltip(#route > 0 and ("OddOrg Default: "..CONTAINERS[route[1]].."; overflow: "..CONTAINERS[route[2]]
+            ..". Full or unavailable homes leave extras in place. Carried supplies and item protections take priority.")
+            or "Equipment follows the wardrobe layout. Unclassified and social items stay in place.")
+    end
     local staged_bag = draft.routes[draft.category]
     local selected_bag = draft.bag
     local staged_choice = staged_bag == false and -1 or staged_bag or (base and 0 or -1)
@@ -5712,7 +5988,9 @@ local function render_ui()
                     ui_text("ORGANIZER PREVIEW",UI_COLORS.gold)
                     ui_tooltip("After this plan - includes items left untouched. Run rebuilds the plan from current bags.")
                     if #ui.preview_plan.logical_moves == 0 then
-                        ui_text("Already organized - no moves needed.",UI_COLORS.text)
+                        ui_text((ui.preview_plan.default_blocked or 0) > 0
+                            and "Default homes are full or unavailable; items stay in place."
+                            or "Already organized - no moves needed.",UI_COLORS.text)
                     end
                     if ui_button((ui.preview_visible and "Show bag summary" or "Show individual moves").."##bulk_details",false,false) then
                         ui.preview_visible=not ui.preview_visible
@@ -5815,6 +6093,8 @@ end)
 ashita.events.register("packet_out", "oddorg_manual_item_move", automatic.observe_retrieval)
 ashita.events.register("packet_in", "oddorg_zone_change", function(e)
     observe_storage_access(e)
+    automatic.observe_house_access(e)
+    automatic.observe_moogle_menu(e)
     if e.injected == false and e.blocked ~= true and e.id == 0x01D
         and type(e.data) == "string" and #e.data >= 12 then
         local flags = 0
@@ -5826,6 +6106,7 @@ ashita.events.register("packet_in", "oddorg_zone_change", function(e)
         end
     end
     if e.injected == false and e.blocked ~= true and (e.id == 0x00A or e.id == 0x00B) then
+        automatic.manual_acquisition, automatic.moogle_menu = nil, nil
         local organizer_error = organizer.running and "Organization stopped when you changed zones." or organizer.error
         local ephemeral_error = ephemeral.running and "Crystal deposit stopped when you changed zones." or ephemeral.error
         cancel_queues(nil)
