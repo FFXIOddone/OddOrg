@@ -1,6 +1,7 @@
 # OddOrg UI product guide
 
-Captured 2026-09-26 from the owner's iterative UI reviews.
+Current UI requirements for maintainers, updated for OddOrg 1.11.0.
+For player instructions, read the [README](../README.md).
 
 ## Purpose and authority
 
@@ -128,6 +129,8 @@ existing control supports focus.
   state to color the player name green; green means enabled, not a packet in flight.
 - OddOrg defaults are the base for a customizable layout, not a collection of
   speculative preference presets. Retain old saved layouts for compatibility.
+- Player documentation should lead with tasks and item placement. Do not market
+  quicksets or legacy presets as a main feature or a required setup step.
 - Label the base option **OddOrg Default**. Show the active-layout label and
   selector only when more than one layout is available. Automatic care always
   keeps its gold STORAGE LAYOUT heading above the item-type placement editor.

@@ -1,176 +1,143 @@
-# OddOrg 1.9.2 player check
+# OddOrg 1.11.0 player checklist
 
-## 1.9.2 visual interaction pass
+Use a test character and ordinary native bag controls. Record the character,
+zone, relevant settings, before/after item counts, visible OddOrg status, and the
+step that failed. Do not mark a live check passed from source, tests, logs, or
+matching installed hashes.
 
-Open Home and Settings at the normal UI scale. Confirm panels, route cards,
-buttons, text inputs, selectors, checkboxes, and sliders show a coherent,
-readable material texture. Hover each interactive control: its surface and cyan
-layered edge should ease in once, hold a composed appearance, and fade softly on
-exit. There should be no recurring sweep or pulse. Tab through controls and
-confirm the cyan focus outline is visible. Disabled actions should remain quiet
-and should not animate as enabled controls. Toggle an option and confirm its knob
-moves smoothly without delaying the setting change. Labels, caret, selection, and
-slider values must remain legible throughout.
+## Window and navigation
 
-Quickset flow: in Automatic care, assign Crystals to Sack and Clusters to Case,
-name and save the set. Check that the compact controls and bag cards fit both
-normal and expanded windows. First Bulk Run must show that same active name.
-Preview should show crystal types/quantities under their intended bags, with
-ignored stock still in its current location. Run, then Preview again: no further
-moves should be needed for those types. Check a full destination: it must wait
-or reject without using a different bag. Unknown/unassigned types stay put.
-Keep some crystals ignored and collect another stack during ordinary play;
-automatic sorting must use the same destination while respecting that reserve.
-Reload and switch characters to check saved-set isolation. Moogle deposits keep
-their own toggle and permission. Storage routes are bulk-only.
+1. Open `/oddorg`. Confirm Home shows the character, short care state, free
+   Inventory slots, items freed this session, and one **Settings** button.
+2. Switch among **Automatic care**, **Item rules**, and **Bulk Run**. Only the
+   selected page should appear. Opening, closing, or navigating the window must
+   not start or stop housekeeping.
+3. Check Home near 360 x 223 and Settings near 855 x 646, then resize both.
+   Confirm labels wrap, controls remain reachable, and content scrolls where
+   needed. The header itself must never have a scrollbar.
+4. Confirm the Settings header is text only, with the character above the page
+   title. Enabled care uses the active green accent; paused or disabled care uses
+   gold.
 
-Offline tests do not establish native Ashita rendering or server behavior. Run
-these on each character after reloading OddOrg; the agent does not drive the game.
+## Automatic care settings
 
-Item rules: choose a crystal, set an Inventory target (for example, 24), choose
-one exact storage bag, and preview the route. Apply it and verify the saved outcome
-appears in the item browser. With global automation off, confirm the rule alone
-does not move anything. Enable **Keep Inventory slots free** with less than the
-target carried and eligible crystals in the chosen bag plus another bag. Refill
-should prefer the chosen bag, move only the shortfall, and keep both the target
-and any Keep quantity protected. If the destination is locked or full, OddOrg
-must not use a substitute.
+1. Enable **Free Inventory slots**. Confirm its slider appears above the three
+   feature controls and accepts 1-80. **Empty Inventory slots** is hover help on
+   that slider, not a permanent label.
+2. Change the slot target and feature switches. **Apply automatic settings**
+   should appear only while the draft differs from saved settings. Revert every
+   change and confirm Apply disappears.
+3. Apply a change. Confirm **Saved for this character** appears briefly, the
+   change takes effect without a reload, and it persists after reload.
+4. Verify settings independently on a second character. Saving while paused must
+   not silently resume work.
+5. Edit **OddOrg Default**, set one item type to a compatible bag, and apply it.
+   The next plan should use the base override without a reload. Unchanged types
+   retain OddOrg placement. Existing named layouts should remain selectable.
 
-For crystals or clusters, separately allow donation and select a staging bag. With
-the carried target met, verify a nearby deposit uses only eligible carried stock
-and stock from that staging bag. Turn off the character Moogle switch and confirm
-the saved item rule does not start unattended donations. Check the actual Moogle
-balance during play; inventory changes alone do not prove a successful deposit.
+## Item rules and protections
 
-Manual overrides: move a partial stack through native controls and wait for
-confirmation. Item rules should show only that quantity at its new location as a
-temporary choice. Consume some of it and confirm the held amount shrinks; collect
-new stock of the same item and confirm it does not inherit the override. Manually
-put away some carried stock and verify the override follows that confirmed amount.
-Release it, then reload and verify all session holds clear while saved item rules
-remain.
+1. Select an item and compare each displayed `Storage name: quantity` row with
+   the game. Locations with zero stock should be absent.
+2. Set **Keep in Inventory** with the exact input and **+1 stack**. The shortcut
+   must add the real stack size to the existing amount.
+3. Under **Target Storage Placement**, test OddOrg placement, Leave copies
+   untouched, and one compatible exact bag. Non-equipment must not offer a
+   wardrobe; Storage is a Mog House bulk destination.
+4. Test Ignore none, a quantity, and all copies. For a quantity spanning bags,
+   Inventory copies should be protected before stored copies.
+5. Confirm **Apply item settings** appears only for unsaved changes, disappears
+   after reverting, and gives a brief saved result after apply. Reload and verify
+   the rule remains character-specific.
+6. Protect a quest item and a crystal reserve. Confirm every applicable workflow
+   below leaves the protected quantities untouched.
 
-The crystal artwork should appear in the header with readable text over its
-dark area. Check the custom switches in both On and Off states, hover feedback,
-and keyboard navigation if enabled in Ashita. In Item rules, the item browser
-stays beside the selected rule; each pane should scroll without hiding the other.
-Check after Alt-Tab and a resolution change: the artwork and controls should
-still render correctly. Texture/device behavior is not proven by offline mocks.
+## Bulk Run organization
 
-Visual check at your normal UI scale: Settings should have top navigation,
-consistent opaque dark panels, aligned controls, and clear On/Off states. The
-empty-slot target should be compact and show a 1-20 slot range. With no edits,
-Apply should look inactive; after an edit it should become prominent. Check
-the smallest permitted window size and a larger size for clipped labels,
-overlapping controls, and usable scrolling. Compare against the approved reference
-screenshot if available; offline layout checks cannot prove this rendered result.
+1. At rest, confirm all scope buttons remain visible and only **View Plan** is
+   offered; Stop, Status, and Run should be hidden.
+2. Select Storage bags and use **View Plan**. Review the embedded bag summary and
+   individual moves. A zero-move plan should still explain the result and reveal
+   **Run organization**.
+3. Change scope or layout, or dismiss the preview. Run must hide until another
+   plan has been displayed.
+4. View a useful plan, then run it. The run must rebuild from current bags.
+   During work, Stop and Status appear while unsafe scope changes stay disabled.
+5. Completion is valid only when a fresh follow-up plan contains no moves. View
+   another plan without changing bags and expect a fixed point.
+6. Split compatible unprotected partial stacks across accessible storage bags.
+   Confirm they co-locate when capacity permits and do not exchange forever.
+7. Press Stop before the first transfer and during a later pass. No unsent action
+   should follow; an already sent transfer may settle and must be reported.
 
-Home and navigation: open `/oddorg`. Expect the character, a compact status,
-relevant current activity, and one **Settings** button. Setup fields and manual
-actions belong in Settings. Resize each view and check that its scrollable
-content remains usable. Back returns to Home; closing either view stops no work.
+## Access and transfer safety
 
-Open Settings and switch between **Automatic care**, **Item rules**, and
-**First Bulk Run**. Only the selected section should be shown. Item rules
-should edit in place, without a second window. First Bulk Run should expose
-manual bag choices, Preview, organization, and crystal deposit controls without
-starting anything merely because the section was opened.
+1. Without confirmed Safe2 access, no plan may target Safe2 because it reports
+   positive capacity. Repeat after a native update confirms access and after it
+   reports locked again.
+2. Outside the appropriate Mog House, unattended sorting and deposits must not
+   use Storage. Manual Storage scope may use it only when loaded and accessible.
+3. Equip a wardrobe item and run organization. The equipped copy must remain
+   pinned. Locked, held, social, unknown, and protected items should also remain
+   untouched under their default rules.
+4. Zone while bags load. OddOrg should wait for loaded-container evidence and
+   then recover, without treating incomplete bags as empty.
+5. Fill an exact destination after preview. The run should stop with the item and
+   recovery reason, without choosing another bag or claiming completion.
+6. Delay a transfer response. The next move must wait for confirmation and its
+   quiet interval. Missing confirmation must stop the run without resending.
 
-Automatic setup: open **Settings > Automatic care** and check that active choices
-match the previous setup. Edit the three automatic-action On/Off controls and the
-empty-slot target. Saved status must stay unchanged until **Apply automatic
-settings**. Review Item rules, apply the automatic choices, close the window,
-and confirm they survive reload independently on each character. Saving while
-paused must leave all automatic actions paused until explicitly resumed.
+## Automatic sorting and carried targets
 
-With the window closed, collect eligible loot, zone or fight, and pass a Moogle.
-Normal waits should recover without pressing Resume. Automatic Moogle start,
-empty visits, confirmed completion, and walking out of range should not create
-routine chat messages. A manual deposit should still report its outcome, and
-an unconfirmed transfer must still stop with an actionable notice.
+1. Enable Free Inventory slots with a reachable target. While alive and idle,
+   add an eligible unreserved stack with too few free slots. Confirm one stack
+   moves at a time and each move is confirmed before another begins.
+2. Enter combat, craft, zone, or make required bags unavailable. Work should wait
+   and recover on a later safe check without requiring Resume.
+3. Enable Sort incoming items while Inventory has ample space. Gain an approved
+   item and confirm it follows the saved layout once. Existing stored stock must
+   not trigger a broad reshuffle.
+4. Fill destinations or protect every candidate. Expect one actionable status,
+   no repeated attempts, and no protection override.
+5. Set **Keep in Inventory** above the carried amount and provide eligible stock
+   in an accessible bag. Confirm only the shortfall refills and the maintained
+   quantity is not sorted or donated.
+6. Repeat with protected stock, a locked source, unavailable stock, and Storage.
+   The shortfall must remain pending rather than use inaccessible stock.
 
-Open the window only when desired: confirm it shows which automatic actions are
-on, any actual blocker, and where to change ignored items. The manual controls
-must distinguish organization bag scopes from crystal collection sources. Check
-the main window and organization preview at your normal UI scale, including a
-long item list; no control should require an unexpectedly tall window.
+## Native manual holds
 
-Item rules: open **Settings > Item rules**, select a crystal, and compare
-Inventory/other-bag counts with the game. Try Ignore all, Ignore an amount, and
-Ignore none. The slider and exact entry should agree, with counts measured in
-individual items. Change the carried target, destination, and donation checkbox
-and confirm they update only the preview until **Apply item settings**. Apply,
-reload, and verify each choice persisted for that character. For a Keep amount
-spanning bags, the preview should reserve Inventory first and then other bags.
-Confirm labels, route cards, controls, and scrolling remain readable at your UI
-scale.
+1. Move part of a stack with native bag controls. After confirmation, Item rules
+   should show a session hold for exactly the moved quantity at its destination.
+2. Acquire more copies and consume held stock. New copies must not inherit the
+   hold; consumption should shrink it.
+3. Move the held quantity again natively, then release it through Item rules.
+   The hold should follow the confirmed move and then clear.
+4. Reload. Session holds should clear while saved Item rules remain. Injected
+   addon moves are outside the native manual-hold contract.
 
-1. Open `/oddorg`, protect an intentional crystal reserve and a quest item, then
-   enable background clearing. With fewer than the configured free slots and an
-   extra unreserved crystal stack, stand idle. The surplus should move to an
-   available portable bag, the reserved stock and quest item should stay, and the
-   free-slot count should increase. The window may be closed during normal play.
-2. Retrieve a partial stack manually with native bag controls. After confirmation,
-   only the moved quantity should show as a temporary choice and stay put. End
-   the override deliberately, or apply a saved Keep amount for ongoing crafting.
-3. Let the character enter combat or craft; background moves should wait until
-   idle. If all portable bags are full, expect one actionable low-space notice,
-   no repeated moves, and no changes to protected items.
-4. Stand near an Ephemeral Moogle without targeting it. Start a deposit with one
-   free Inventory slot and multiple stored crystal stacks. Expect continuation
-   through observed moves/trades while keeping reserves. Observe the Moogle's
-   actual stored balance; inventory disappearance alone is not balance proof.
-5. Use Stop/Pause, then Resume, and reload on both characters. Confirm that each
-   character keeps its own enabled state, free-slot target, and item rules. Manual
-   overrides last only for the current session; saved rules survive reload.
+## Crystal and cluster deposits
 
-Report the character, visible status text, intended carry rule, and observed item
-counts for any mismatch. Do not mark these checks passed from source or hashes.
+1. In **Bulk Run**, choose Crystals and a source scope. **Deposit surplus** does
+   not require View Plan. Stop and Status appear only during an active deposit.
+2. Protect a reserve and provide carried and staged stored surplus. Confirm only
+   allowed crystals and clusters are gathered and traded, using smaller batches
+   when Inventory space is limited.
+3. Stay near the same Ephemeral Moogle through multiple batches. OddOrg must not
+   change the player's target or movement. Verify the actual Moogle balance;
+   disappearing Inventory is insufficient proof.
+4. Walk out of range while a batch settles. No new action should start after the
+   sent action settles. Standing nearby after success or failure must not restart
+   immediately.
+5. Enable Moogle deposits and approach without targeting. Expect one automatic
+   attempt for the encounter. Leave beyond the rearm distance for at least two
+   seconds, return, and confirm a new attempt is allowed.
+6. Force an unconfirmed stage or trade. OddOrg must stop, preserve protection
+   budgets, avoid retrying, and show an actionable failure. Empty visits and
+   confirmed automatic completion should remain quiet.
 
-Loading status: zone with no manual run active. Once bags finish loading,
-automatic status should recover and no permanent queue error should claim they
-are still loading. A run interrupted by zoning should say it stopped, while a
-genuine incomplete snapshot names the waiting bag/flag mask in status and probes.
+## Report a discrepancy
 
-Locked Safe2: click Preview and Organize on a character without Safe2 unlocked.
-Neither should route items into Safe2, even if its reported size is positive.
-The remaining accessible bags should organize normally. On an unlocked character,
-a native local-player update should confirm access (`storage_access` in probes)
-and preserve it across reloads. If a transfer fails, the manual status should
-name its step, item, source, and destination instead of showing a deposit error.
-
-Transfer pacing: run Organize after reloading. It should leave the configured
-delay after each confirmed transfer, including when a response was slow. Check
-whether the remaining plan finishes; successful manual movement alone does not
-prove the intermittent addon rejection is fixed. Unconfirmed moves must still
-stop without resending.
-
-Organization stability: with identical material stacks split between Inventory
-and a full overflow bag, Preview should not propose exchanging those stacks.
-After any useful organization finishes, preview again without changing items;
-expect no further rearrangement. With background clearing enabled, an eligible
-item already stored should remain stored when organization runs.
-
-Incoming sorting: enable `/oddorg sort on` on one character outside the Mog House.
-An enabled old house setting should migrate automatically. Gain an unreserved
-crystal stack while many Inventory slots remain free; it should move once to
-available storage. An unknown quest item, excluded crystal, or manually retrieved
-held item should remain carried. Opt in one other item and confirm it sorts.
-Existing stored items should not reshuffle. No automatic move should use the
-restricted Storage bag. Repeat after a zone change: wait for complete bag loading,
-with no false empty-bag plan or first pull into an already-full destination.
-
-Nearby deposits: protect a crystal reserve, enable `/oddorg deposit on`, and walk
-past an Ephemeral Moogle without targeting it. Expect one protected surplus run
-with no window opening or target change. Stay nearby to finish multiple batches;
-walk away during a run and expect no further staged moves/trades after the sent
-action settles. Standing beside the Moogle after completion or a failed run must
-not restart it. Walk beyond eight yalms for at least two seconds and return to
-allow a new attempt. Check the actual stored crystal balance, not just Inventory.
-
-Pause/Stop or manually retrieve an item during automatic work. A sent action may
-finish, but no later queued action should follow it. The confirmed moved quantity
-should have a session hold. Resume restores automatic sorting; a claimed Moogle pass
-still requires leaving and reapproaching. Check each character's independent
-sort/deposit settings after reload. Manual Organize remains available for full
-bag/wardrobe layout changes and appropriate Mog House Storage access.
+Include the character, zone, scope or rule, before/after counts by bag, exact
+visible status, and whether the action was automatic or manual. Keep source,
+package, installation, and live-observation evidence separate.

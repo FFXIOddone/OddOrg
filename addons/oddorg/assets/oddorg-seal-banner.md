@@ -1,3 +1,5 @@
+> **Archived design material.** This document records earlier artwork or mascot exploration. OddOrg 1.11.0 has no mascot or illustrated header. These notes are not current player instructions or an active implementation plan.
+
 # OddOrg crystal dragon infinity seal
 
 ## Current artwork: 1.9.6
